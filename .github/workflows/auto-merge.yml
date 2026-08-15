@@ -1,0 +1,33 @@
+name: Auto-merge
+
+# Enables GitHub's native auto-merge on a PR so it merges itself the
+# instant required checks (ci.yml's `test` job, via branch protection) go
+# green — no manual "Merge" click for first-party changes.
+#
+# Deliberately restricted to PRs authored by the maintainer, from a branch
+# in this repo (never a fork): see the `if:` below. This is what keeps
+# external contributions from ever merging themselves regardless of their
+# own CI result — see CONTRIBUTING.md. Using `pull_request` (not
+# `pull_request_target`) means a fork-originated PR gets a read-only
+# GITHUB_TOKEN by default, which would make the `gh pr merge` call fail
+# outright even if the `if:` condition were somehow wrong — a second,
+# structural backstop, not just a config check.
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+
+permissions:
+  pull-requests: write
+  contents: write
+
+jobs:
+  enable-auto-merge:
+    if: >
+      github.event.pull_request.user.login == 'pankajads' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh pr merge --auto --squash "${{ github.event.pull_request.number }}"

@@ -1,0 +1,6 @@
+# Every file in this repo requires review from the owner before merging,
+# once "Require review from Code Owners" is enabled in branch protection —
+# see CONTRIBUTING.md. Claude Code commits under this same GitHub identity
+# (git config user.email pankajads@gmail.com) rather than a separate
+# account, so this single line covers both — see CONTRIBUTORS.md.
+* @pankajads

@@ -6,26 +6,12 @@ release is three steps every time.
 
 ## One-time setup (do this once, right after pushing the repo to GitHub)
 
-### 1. Require CI to pass before a PR can merge
+### 1. Branch protection + auto-merge
 
-This is a GitHub *repository setting*, not a file in this repo — `.github/workflows/ci.yml`
-only runs the checks, a branch-protection rule is what actually blocks a merge on failure:
-
-```bash
-gh api repos/pankajads/factfolio/branches/main/protection -X PUT \
-  -H "Accept: application/vnd.github+json" \
-  -f 'required_status_checks[strict]=true' \
-  -f 'required_status_checks[contexts][]=test' \
-  -F 'enforce_admins=true' \
-  -F 'required_pull_request_reviews=null' \
-  -F 'restrictions=null'
-```
-
-(`test` is the job name in `ci.yml`.) Or via the UI: **Settings → Branches →
-Add branch protection rule** → branch name pattern `main` → check **Require
-status checks to pass before merging** → select `test`. Either way, this
-needs at least one CI run to have happened on the repo already so GitHub
-knows the check exists to select.
+Moved to [`CONTRIBUTING.md`](../CONTRIBUTING.md) — it covers the full merge
+policy (who can merge, PR + CI required, auto-merge for the maintainer's
+own PRs) in one place rather than splitting it from the branch-protection
+commands that implement it.
 
 ### 2. Register PyPI trusted publishing (no API token needed)
 
