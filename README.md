@@ -214,6 +214,8 @@ anyone in India to use, study, or build on. Issues and pull requests are
 welcome — `uv run pytest` and `uv run ruff check src/ tests/` should both
 pass clean before opening one; every PR runs the same checks in CI
 (`.github/workflows/ci.yml`) and needs a green build before it can merge.
+Merging itself is maintainer-only — see [`CONTRIBUTING.md`](CONTRIBUTING.md)
+for the full policy and [`CONTRIBUTORS.md`](CONTRIBUTORS.md) for who that is.
 If FactFolio is useful to you, a ⭐ on the repo helps other investors find it.
 
 ## Professional services
