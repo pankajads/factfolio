@@ -1,0 +1,172 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Zerodha symbol  →  yfinance ticker map
+#
+# WHY THIS FILE EXISTS
+#   Zerodha's trading symbol is NOT always the yfinance ticker. Renames,
+#   relistings and demergers break the naive `f"{symbol}.NS"` assumption, and
+#   they break it *silently* — yfinance returns an empty frame, not an error.
+#
+#   `candidates` is an ordered list. The validator tries each in turn and uses
+#   the first that returns a usable price series. This makes resolution
+#   empirical rather than a guess baked into code.
+#
+# FIELDS
+#   name           human-readable company name
+#   candidates     ordered yfinance tickers to try (first working one wins)
+#   sector         used for concentration limits
+#   tier           large | mid | small  — drives core/satellite classification
+#   bucket         core | satellite     — explicit policy classification
+#   notes          anything that makes this symbol unusual
+# ─────────────────────────────────────────────────────────────────────────────
+
+symbols:
+  BEL:
+    name: Bharat Electronics Ltd
+    candidates: [BEL.NS, BEL.BO]
+    sector: Defence
+    tier: large
+    bucket: satellite
+    notes: PSU defence electronics. Thematic satellite despite large-cap status.
+
+  ETERNAL:
+    name: Eternal Ltd (formerly Zomato)
+    candidates: [ETERNAL.NS, ZOMATO.NS, ETERNAL.BO]
+    sector: Consumer Tech
+    tier: large
+    bucket: satellite
+    notes: >
+      Renamed from Zomato in 2025. Pre-rename history may only exist under
+      ZOMATO.NS — the two series must be stitched for long-window analysis.
+
+  GRANULES:
+    name: Granules India Ltd
+    candidates: [GRANULES.NS, GRANULES.BO]
+    sector: Pharma
+    tier: small
+    bucket: satellite
+
+  GUJTHEM:
+    name: Gujarat Themis Biosyn Ltd
+    candidates: [GUJTHEM.NS, GUJTHEM.BO]
+    sector: Pharma
+    tier: small
+    bucket: satellite
+    notes: Thinly covered small cap. Fundamentals data may be sparse.
+
+  HDFCBANK:
+    name: HDFC Bank Ltd
+    candidates: [HDFCBANK.NS, HDFCBANK.BO]
+    sector: Banking
+    tier: large
+    bucket: core
+    notes: Currently the ONLY core holding in the portfolio.
+
+  HEXT:
+    name: Hexaware Technologies Ltd
+    candidates: [HEXT.NS, HEXAWARE.NS, HEXT.BO]
+    sector: IT Services
+    tier: mid
+    bucket: satellite
+    notes: Relisted on NSE in Feb 2025 after 2020 delisting. Short history.
+
+  HYUNDAI:
+    name: Hyundai Motor India Ltd
+    candidates: [HYUNDAI.NS, HYUNDAI.BO]
+    sector: Automobile
+    tier: large
+    bucket: satellite
+    notes: IPO Oct 2024. Under ~2y history — limits long-window correlation.
+
+  IDEA:
+    name: Vodafone Idea Ltd
+    candidates: [IDEA.NS, IDEA.BO]
+    sector: Telecom
+    tier: mid
+    bucket: satellite
+    notes: >
+      Penny stock, heavily indebted, AGR overhang, ongoing equity dilution.
+      Highly speculative — treat position sizing with care.
+
+  JIOFIN:
+    name: Jio Financial Services Ltd
+    candidates: [JIOFIN.NS, JIOFIN.BO]
+    sector: Financial Services
+    tier: large
+    bucket: satellite
+    notes: Demerged from Reliance Industries, Aug 2023. History starts there.
+
+  SUZLON:
+    name: Suzlon Energy Ltd
+    candidates: [SUZLON.NS, SUZLON.BO]
+    sector: Renewable Energy
+    tier: mid
+    bucket: satellite
+    notes: Turnaround story with a long history of dilution. Volatile.
+
+  TATASTEEL:
+    name: Tata Steel Ltd
+    candidates: [TATASTEEL.NS, TATASTEEL.BO]
+    sector: Metals
+    tier: large
+    bucket: satellite
+    notes: Cyclical. Large cap but not a defensive core holding.
+
+  TMCV:
+    name: Tata Motors Commercial Vehicles
+    candidates: [TMCV.NS, TATAMOTORS.NS, TMLCV.NS, TMCV.BO]
+    sector: Automobile
+    tier: large
+    bucket: satellite
+    notes: >
+      DEMERGER ENTITY (Oct 2025 Tata Motors split). Very short standalone
+      history. Ticker is uncertain — validator resolves empirically.
+      Correlation maths must handle the short series or exclude it.
+
+  TMPV:
+    name: Tata Motors Passenger Vehicles
+    candidates: [TMPV.NS, TATAMOTORS.NS, TMPV.BO]
+    sector: Automobile
+    tier: large
+    bucket: satellite
+    notes: >
+      DEMERGER ENTITY (Oct 2025 Tata Motors split). Sibling of TMCV — the two
+      are economically linked and MUST land in the same correlation community.
+      If they don't, the price input is wrong.
+
+  YESBANK:
+    name: Yes Bank Ltd
+    candidates: [YESBANK.NS, YESBANK.BO]
+    sector: Banking
+    tier: mid
+    bucket: satellite
+    notes: Post-rescue turnaround. Structurally different from pre-2020 entity.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Benchmark and sector indices (for regime detection and beta)
+# ─────────────────────────────────────────────────────────────────────────────
+indices:
+  NIFTY50:      { name: Nifty 50,          candidates: ["^NSEI"] }
+  SENSEX:       { name: BSE Sensex,        candidates: ["^BSESN"] }
+  NIFTYMIDCAP:  { name: Nifty Midcap 50,   candidates: ["^NSEMDCP50"] }
+  NIFTY500:     { name: Nifty 500,         candidates: ["^CRSLDX"] }
+  NIFTYNEXT50:  { name: Nifty Next 50,     candidates: ["^NSMIDCP"] }
+  INDIAVIX:     { name: India VIX,         candidates: ["^INDIAVIX"] }
+  NIFTYBANK:    { name: Nifty Bank,        candidates: ["^NSEBANK"] }
+  # Yahoo does not serve Nifty Smallcap 100 as an index (^CNXSC returns a
+  # 1-day stub). This is an ETF standing in as a PROXY — it tracks a momentum-
+  # quality subset, not the broad smallcap index, so treat readings as
+  # directional only. Labelled honestly rather than passed off as the index.
+  SMALLCAP_PROXY:
+    name: Nifty Smallcap (ETF proxy — NOT the index)
+    candidates: ["SMALLCAP.NS"]
+    is_proxy: true
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Analysis thresholds
+# ─────────────────────────────────────────────────────────────────────────────
+settings:
+  # A series shorter than this many trading days is flagged INSUFFICIENT_HISTORY
+  # and excluded from correlation maths rather than silently corrupting it.
+  min_history_days: 60
+  # Preferred window for correlation / MST construction
+  correlation_window_days: 250
