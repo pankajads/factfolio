@@ -204,6 +204,43 @@ def cmd_report(args) -> int:
     return 0
 
 
+def cmd_welcome(args) -> int:
+    """No subcommand given — what someone who downloaded the standalone
+    executable and double-clicked it actually experiences, as opposed to
+    someone who already knows to type `factfolio status`. Runs first-time
+    setup if needed, then goes straight to the one thing that's an actual
+    UI (the dashboard) instead of a bare usage error. Since a double-clicked
+    console window on Windows closes itself the instant the process exits,
+    this also prints a command menu and waits for a keypress afterward
+    rather than vanishing before anyone can read it.
+    """
+    from mybroker.config import POLICY_FILE
+
+    print(f"{BOLD}FactFolio{RESET}  {DIM}— no command given, opening the dashboard{RESET}\n",
+          flush=True)
+
+    if not POLICY_FILE.exists():
+        cmd_init(args)
+        print()
+
+    cmd_dashboard(args)  # blocks until the user stops it (Ctrl+C)
+
+    print(f"\n{BOLD}Other things you can run:{RESET}")
+    print(f"  factfolio status      {DIM}instant snapshot, no LLM{RESET}")
+    print(f"  factfolio report      {DIM}full multi-agent review{RESET}")
+    print(f"  factfolio chat        {DIM}terminal Q&A{RESET}")
+    print(f"  factfolio validate    {DIM}resolve tickers — do this before report/chat{RESET}")
+    print(f"  factfolio --help      {DIM}everything{RESET}")
+
+    # Only pause for a frozen build in an actual interactive console — never
+    # when piped/scripted (would hang forever waiting for input that never
+    # comes), and pip-installed/uv-run users are already at a shell prompt
+    # that won't disappear on them regardless.
+    if getattr(sys, "frozen", False) and sys.stdin.isatty():
+        input(f"\n{DIM}Press Enter to exit…{RESET}")
+    return 0
+
+
 def cmd_init(_args) -> int:
     """First-run setup: create the runtime dirs and a starter policy file.
 
@@ -423,7 +460,12 @@ def main(argv: list[str] | None = None) -> int:
         description="Indian equity & mutual fund portfolio advisory agent.",
     )
     parser.add_argument("--version", action="version", version=f"factfolio {__version__}")
-    sub = parser.add_subparsers(dest="command", required=True)
+    # Not required: someone who downloaded the standalone executable and
+    # double-clicked it (no terminal, no arguments) should land on
+    # cmd_welcome below, not a bare "command required" usage error in a
+    # console window that closes itself the instant the process exits.
+    parser.set_defaults(func=cmd_welcome)
+    sub = parser.add_subparsers(dest="command", required=False)
 
     sub.add_parser("init", help="first-run setup: dirs + a starter investment_policy.md"
                    ).set_defaults(func=cmd_init)

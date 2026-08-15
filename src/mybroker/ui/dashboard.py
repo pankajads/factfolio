@@ -108,14 +108,57 @@ def render() -> None:
         _render_chat_tab()
 
 
+def _render_holdings_uploader() -> bool:
+    """Save uploaded files straight into holdings_inbox/ for
+    portfolio/importers.py's existing sniff-and-classify pipeline to pick
+    up on the next read — no parsing here, just placing the file where the
+    pipeline already looks. Returns True if anything was saved, so the
+    caller knows to rerun and show the freshly-loaded portfolio."""
+    from mybroker.config import HOLDINGS_INBOX_DIR
+    from mybroker.portfolio.importers import SUPPORTED_SUFFIXES
+
+    st.caption(
+        "🔒 **Stays on this machine.** Saved straight to `holdings_inbox/` on "
+        "disk here — never uploaded anywhere else. Any broker's csv/xls/xlsx/pdf "
+        "export, equity or mutual fund, any filename."
+    )
+    uploaded = st.file_uploader(
+        "Upload holdings file(s)",
+        type=[s.lstrip(".") for s in sorted(SUPPORTED_SUFFIXES)],
+        accept_multiple_files=True,
+        key="holdings_uploader",
+    )
+    if not uploaded:
+        return False
+
+    HOLDINGS_INBOX_DIR.mkdir(parents=True, exist_ok=True)
+    for f in uploaded:
+        (HOLDINGS_INBOX_DIR / f.name).write_bytes(f.getvalue())
+    st.success(
+        f"Saved {len(uploaded)} file{'s' if len(uploaded) != 1 else ''} → "
+        f"holdings_inbox/. Reloading…"
+    )
+    return True
+
+
 def _render_overview_tab() -> None:
     st.caption("Deterministic snapshot — no LLM, no network. Same engine as `mybroker status`.")
 
     try:
         portfolio = load_portfolio()
-    except FileNotFoundError as exc:
-        st.error(str(exc))
+    except FileNotFoundError:
+        st.subheader("👋 Welcome — let's get your portfolio in")
+        st.write(
+            "Drop your broker's holdings export below to get started. "
+            "Nothing is analysed, and nothing leaves this machine, until you do."
+        )
+        if _render_holdings_uploader():
+            st.rerun()
         return
+
+    with st.expander("📂 Add more holdings files"):
+        if _render_holdings_uploader():
+            st.rerun()
 
     snap = snapshot(portfolio)
     pol = Policy.load()
