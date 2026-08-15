@@ -405,6 +405,17 @@ def cmd_cron(args) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Windows only gives stdout/stderr a UTF-8 codepage for an *interactive*
+    # console — the moment either is redirected/piped/captured (a CI step,
+    # `factfolio status > out.txt`, anything), Python falls back to the
+    # legacy codepage (cp1252), which can't encode the ✓/✗/₹ this CLI prints
+    # everywhere, and crashes with UnicodeEncodeError before printing
+    # anything useful. reconfigure() (Python 3.7+) forces UTF-8 with a safe
+    # fallback instead of a crash; harmless no-op on platforms already UTF-8.
+    for _stream in (sys.stdout, sys.stderr):
+        if hasattr(_stream, "reconfigure"):
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+
     from mybroker import __version__
 
     parser = argparse.ArgumentParser(
