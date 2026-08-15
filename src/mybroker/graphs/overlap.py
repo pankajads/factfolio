@@ -44,7 +44,7 @@ def bipartite_overlap(
     total_mf_weight = sum(scheme_holdings_pct.get(s, {}).get("__scheme_weight_pct__", 0) for s in scheme_holdings_pct)
 
     true_exposure: dict[str, float] = dict(stock_weights_pct)
-    for scheme, holdings in scheme_holdings_pct.items():
+    for _scheme, holdings in scheme_holdings_pct.items():
         scheme_weight_pct = holdings.get("__scheme_weight_pct__", 0.0)
         for stock, pct_of_scheme in holdings.items():
             if stock == "__scheme_weight_pct__":
