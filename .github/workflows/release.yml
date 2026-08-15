@@ -1,0 +1,140 @@
+name: Release
+
+# Triggered by pushing a tag like v0.2.0. Order matters: nothing gets
+# published until the version check AND the full test suite both pass, and
+# nothing gets attached to the GitHub Release until PyPI publish AND all
+# three platform executables build *and* smoke-test clean.
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write   # to create the GitHub Release and upload assets
+  id-token: write    # for PyPI trusted publishing (OIDC) — no API token secret
+
+jobs:
+  verify-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Confirm tag matches pyproject.toml version
+        id: check
+        run: |
+          set -euo pipefail
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PYPROJECT_VERSION=$(grep -m1 '^version = ' pyproject.toml | sed -E 's/version = "(.*)"/\1/')
+          if [ "$TAG_VERSION" != "$PYPROJECT_VERSION" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME (version $TAG_VERSION) does not match pyproject.toml's version $PYPROJECT_VERSION — bump pyproject.toml and re-tag."
+            exit 1
+          fi
+          echo "version=$PYPROJECT_VERSION" >> "$GITHUB_OUTPUT"
+
+  test:
+    needs: verify-version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+      - run: uv sync --extra dev
+      - run: uv run ruff check src/ tests/
+      - run: uv run pytest -q
+
+  publish-pypi:
+    needs: [verify-version, test]
+    runs-on: ubuntu-latest
+    environment: pypi   # matches the trusted-publisher config on pypi.org — see docs/RELEASING.md
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+      - name: Build sdist + wheel
+        run: uv build
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+  build-executables:
+    needs: [verify-version, test]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset_name: factfolio-linux-x86_64
+          - os: macos-latest
+            asset_name: factfolio-macos-arm64
+          - os: windows-latest
+            asset_name: factfolio-windows-x86_64.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+      - run: uv sync --extra build
+
+      - name: Build standalone executable (PyInstaller)
+        run: uv run pyinstaller packaging/factfolio.spec --noconfirm
+
+      # Catches a broken build (missing hidden import, bad data bundling)
+      # right here instead of shipping it — same check on every OS in the
+      # matrix, not just the one a maintainer happened to build on locally.
+      - name: Smoke test (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+          ./dist/factfolio --version
+          cd "$RUNNER_TEMP" && mkdir -p smoketest && cd smoketest
+          "$GITHUB_WORKSPACE/dist/factfolio" init
+          test -d memory
+      - name: Smoke test (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & "dist\factfolio.exe" --version
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          New-Item -ItemType Directory -Path "$env:RUNNER_TEMP\smoketest" | Out-Null
+          Set-Location "$env:RUNNER_TEMP\smoketest"
+          & "$env:GITHUB_WORKSPACE\dist\factfolio.exe" init
+          if (-not (Test-Path memory)) { exit 1 }
+
+      - name: Rename artifact
+        shell: bash
+        run: |
+          mkdir -p out
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp dist/factfolio.exe "out/${{ matrix.asset_name }}"
+          else
+            cp dist/factfolio "out/${{ matrix.asset_name }}"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: out/${{ matrix.asset_name }}
+          if-no-files-found: error
+
+  github-release:
+    needs: [verify-version, publish-pypi, build-executables]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: factfolio v${{ needs.verify-version.outputs.version }}
+          generate_release_notes: true
+          files: artifacts/*
+          body: |
+            Also published to PyPI: `pip install factfolio==${{ needs.verify-version.outputs.version }}` or `uvx factfolio init`.
+
+            Standalone executables below need no Python install — but still
+            need the separate `claude` CLI installed and logged in
+            (`claude login`) for `factfolio report` / `factfolio chat`; see
+            the README's Authentication section.

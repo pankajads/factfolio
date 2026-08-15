@@ -1,0 +1,31 @@
+name: CI
+
+# Gate for every PR and every push to main: lint + the full test suite.
+# Pair this with a branch-protection rule on `main` requiring this workflow
+# (see docs/RELEASING.md) so a PR literally cannot merge without it passing —
+# the workflow alone doesn't block anything on its own.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      - name: Lint (ruff)
+        run: uv run ruff check src/ tests/
+
+      - name: Test (pytest, network-dependent tests excluded)
+        run: uv run pytest -q

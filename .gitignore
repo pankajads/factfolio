@@ -1,0 +1,64 @@
+# ─────────────────────────────────────────────────────────────
+# SENSITIVE — personal financial data. Never commit.
+# ─────────────────────────────────────────────────────────────
+holdings.csv
+holdings*.csv
+holdings_mf.csv
+holdings_inbox/
+assets.yaml
+memory/
+reports/
+logs/
+*.db
+*.sqlite
+*.sqlite3
+
+# Secrets
+.env
+.env.local
+*.key
+*.pem
+credentials.json
+token.json
+
+# ─────────────────────────────────────────────────────────────
+# Python
+# ─────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+.venv/
+venv/
+ENV/
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# ─────────────────────────────────────────────────────────────
+# Tooling / OS
+# ─────────────────────────────────────────────────────────────
+.DS_Store
+.idea/
+*.swp
+.ipynb_checkpoints/
+.streamlit/secrets.toml
+
+# Local AI-assistant tool config — dev-workflow state, not project content
+.claude/
+.agents/
+
+# Cache directory for market data
+.cache/
+data_cache/
