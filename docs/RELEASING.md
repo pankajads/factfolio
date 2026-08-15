@@ -29,17 +29,23 @@ knows the check exists to select.
 
 ### 2. Register PyPI trusted publishing (no API token needed)
 
-On [pypi.org](https://pypi.org) (register the `factfolio` project name
-first with a one-off manual `twine upload` or reserve it via PyPI's UI, if
-it doesn't exist yet) → your project → **Publishing** → **Add a new
-publisher** → GitHub:
+No manual upload needed first — PyPI's **pending publisher** flow lets you
+claim the `factfolio` project name via GitHub Actions before it exists on
+PyPI at all. Go to
+[pypi.org/manage/account/publishing/](https://pypi.org/manage/account/publishing/)
+(account needs 2FA enabled) and add:
 
 | Field | Value |
 |---|---|
+| PyPI Project Name | `factfolio` |
 | Owner | `pankajads` |
-| Repository | `factfolio` |
+| Repository name | `factfolio` |
 | Workflow name | `release.yml` |
 | Environment name | `pypi` |
+
+The *first* successful run of `release.yml`'s `publish-pypi` job from that
+exact repo/workflow/environment creates the project and publishes to it —
+nothing publishes just from registering this.
 
 This is what `id-token: write` + the `environment: pypi` in
 `release.yml`'s `publish-pypi` job authenticates against — no secret to
