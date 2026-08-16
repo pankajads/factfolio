@@ -21,6 +21,7 @@ model decides to do.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
@@ -205,8 +206,19 @@ def build_options(run_id: str) -> ClaudeAgentOptions:
     )
 
 
-async def run_review(prompt: str | None = None) -> RunResult:
-    """Run one review and return the report plus run telemetry."""
+async def run_review(
+    prompt: str | None = None,
+    on_event: Callable[[str], None] | None = None,
+) -> RunResult:
+    """Run one review and return the report plus run telemetry.
+
+    on_event, if given, is called synchronously with a short human-readable
+    string each time a tool gets called or an agent starts writing — the
+    only way to know a multi-minute run is actually progressing rather than
+    stalled. cli.py's `report` command uses it to drive a live status line;
+    nothing here depends on it (tests, the MCP server, and any other caller
+    can leave it as None).
+    """
     started = datetime.now(UTC)
     today = started.strftime("%Y-%m-%d")
     run_id = f"{started.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
@@ -224,14 +236,24 @@ async def run_review(prompt: str | None = None) -> RunResult:
     cost: float | None = None
     turns = 0
 
+    def emit(text: str) -> None:
+        if on_event is not None:
+            on_event(text)
+
     try:
         async for message in query(prompt=prompt, options=options):
             if isinstance(message, AssistantMessage):
                 for block in message.content:
                     if isinstance(block, TextBlock):
                         chunks.append(block.text)
+                        emit("writing…")
                     elif isinstance(block, ToolUseBlock):
                         tool_calls.append(block.name)
+                        if block.name == "Agent":
+                            who = block.input.get("subagent_type") or "subagent"
+                            emit(f"dispatching {who}")
+                        else:
+                            emit(f"tool: {block.name}")
             elif isinstance(message, ResultMessage):
                 cost = message.total_cost_usd
                 turns = message.num_turns

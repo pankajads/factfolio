@@ -40,7 +40,7 @@ HOLDINGS_EQUITY = PROJECT_ROOT / "holdings.csv"
 HOLDINGS_MF = PROJECT_ROOT / "holdings_mf.csv"
 ASSETS_FILE = PROJECT_ROOT / "assets.yaml"
 
-# Drop any broker export here — csv, xls, xlsx or pdf, equity or mutual-fund,
+# Drop any broker export here — csv, xls, xlsx, pdf, or txt, equity or mutual-fund,
 # any filename. portfolio/importers.py sniffs each file's header row and
 # content to classify and parse it; load_portfolio() merges everything found
 # here with the legacy HOLDINGS_EQUITY/HOLDINGS_MF files above.

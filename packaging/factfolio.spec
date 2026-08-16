@@ -4,18 +4,14 @@
 Run from the repo root:
     uv run --extra build pyinstaller packaging/factfolio.spec --noconfirm
 
-Streamlit has no PyInstaller hook of its own (checked: neither streamlit nor
-pyinstaller-hooks-contrib ships one), so its frontend static assets and
-dynamically-imported submodules have to be collected explicitly here —
-that's the single most fragile part of this build. plotly and pdfplumber get
-the same treatment for the same reason (bundled non-.py data / runtime
-plugin discovery that PyInstaller's default import analysis won't see).
+factfolio is a pure terminal tool — no GUI, no bundled frontend — so this
+spec only needs to worry about the handful of packages that do their own
+runtime data/plugin discovery PyInstaller's default import analysis won't
+see: pdfplumber (bundled fonts/CMaps) and yfinance (bundled data files).
 
-Two files are bundled as literal data (not compiled into the archive)
-because they're opened as real filesystem paths at runtime, not imported as
-modules: tickers.yaml (mybroker.config.SRC_DIR / "data" / "tickers.yaml")
-and dashboard.py (mybroker.ui.cli.cmd_dashboard, launched via Streamlit's
-bootstrap.run() in the frozen-executable branch).
+One file is bundled as literal data (not compiled into the archive) because
+it's opened as a real filesystem path at runtime, not imported as a module:
+tickers.yaml (mybroker.config.SRC_DIR / "data" / "tickers.yaml").
 """
 
 from pathlib import Path
@@ -29,7 +25,7 @@ datas = []
 binaries = []
 hiddenimports = []
 
-for pkg in ("streamlit", "plotly", "pdfplumber", "yfinance"):
+for pkg in ("pdfplumber", "yfinance"):
     d, b, h = collect_all(pkg)
     datas += d
     binaries += b
@@ -41,7 +37,6 @@ datas += copy_metadata("factfolio")
 
 datas += [
     (str(SRC / "mybroker" / "data" / "tickers.yaml"), "mybroker/data"),
-    (str(SRC / "mybroker" / "ui" / "dashboard.py"), "mybroker/ui"),
 ]
 
 a = Analysis(

@@ -268,3 +268,33 @@ class TestInboxImport:
         bad.write_text("Some random column,Another column\nfoo,bar\n")
         with pytest.raises(ValueError, match="mystery.csv"):
             extract_positions(bad)
+
+    @pytest.mark.parametrize("delimiter", [",", "\t", ";"])
+    def test_txt_sniffs_its_own_delimiter(self, tmp_path, delimiter):
+        """.txt has no fixed delimiter across brokers — comma, tab, and
+        semicolon all have to parse, not just whichever one a hand-written
+        fixture happens to use."""
+        from mybroker.portfolio.importers import extract_positions
+
+        rows = [
+            ["Instrument", "Qty.", "Avg. cost", "Invested", "Cur. val"],
+            ["INFY", "10", "1500.00", "15000.00", "16000.00"],
+            ["TCS", "5", "3200.00", "16000.00", "17000.00"],
+        ]
+        path = tmp_path / "holdings.txt"
+        path.write_text("\n".join(delimiter.join(row) for row in rows) + "\n")
+
+        kind, positions, _warnings = extract_positions(path)
+        assert kind == "equity"
+        assert {p.symbol for p in positions} == {"INFY", "TCS"}
+
+    def test_txt_falls_back_to_comma_when_sniffing_fails(self, tmp_path):
+        """A single-column file gives the sniffer nothing to distinguish —
+        it should default to comma rather than raising."""
+        from mybroker.portfolio.importers import _read_txt_grid
+
+        path = tmp_path / "single_column.txt"
+        path.write_text("Instrument\nINFY\nTCS\n")
+
+        grid = _read_txt_grid(path)
+        assert grid == [["Instrument"], ["INFY"], ["TCS"]]

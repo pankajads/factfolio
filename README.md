@@ -140,10 +140,9 @@ yourself (versioning, PyPI, the executables above): [`docs/RELEASING.md`](docs/R
 
 ### Authentication
 
-`factfolio report` and `factfolio chat` (terminal and the dashboard's Chat
-tab) call the Claude Agent SDK, which shells out to the `claude` CLI and
-lets *it* resolve credentials — this project never sets an API key itself.
-That means:
+`factfolio report` and `factfolio chat` call the Claude Agent SDK, which
+shells out to the `claude` CLI and lets *it* resolve credentials — this
+project never sets an API key itself. That means:
 
 - **Default: your local `claude login` session.** If you're already logged
   in (`claude` in a terminal, Pro/Max or Console), no setup is needed —
@@ -155,29 +154,45 @@ That means:
 Every command that calls the LLM prints which one is active
 (`auth: local claude login session` / `auth: ANTHROPIC_API_KEY (env var
 override)`) so it's never ambiguous which credential a run used.
-`factfolio status`/`validate`/`cron`/`estimate-dates` and the dashboard's
-Overview tab need neither — they're pure deterministic Python.
+`factfolio status`/`validate`/`cron`/`estimate-dates` need neither — they're
+pure deterministic Python.
 
 ## Usage
+
+FactFolio is a terminal tool, full stop — no browser, no GUI, identical
+output on macOS/Linux/Windows. `report` writes the full markdown review to
+`reports/` and prints every recommendation as a table right in your
+terminal — symbol, action, conviction, and the reasoning behind it — not a
+wall of text you have to go find it in.
 
 ```bash
 uv run validate-tickers        # must pass before any agent run
 uv run pytest                  # verify the maths
 uv run factfolio status        # deterministic snapshot — no LLM, instant
-uv run factfolio report        # full multi-agent review → reports/
-uv run factfolio dashboard     # Streamlit dashboard, incl. a chat tab
+uv run factfolio report        # full multi-agent review → reports/, table in your terminal
 uv run factfolio chat          # terminal Q&A REPL, one agent
+uv run factfolio mcp           # run as an MCP server for other tools/agents (VS Code, Claude Desktop, ...)
 uv run factfolio cron          # grade past recommendations — no LLM
 uv run factfolio estimate-dates  # tentative purchase-date estimation — no LLM
 ```
+
+### Integrating with other tools (`factfolio mcp`)
+
+`factfolio mcp` runs as a standalone [MCP](https://modelcontextprotocol.io)
+server over stdio — point any MCP-aware client at it (the VS Code Claude
+extension, Claude Desktop, another agent) the same way you'd point it at
+any other local MCP server, and it can call `portfolio_status`,
+`validate_tickers`, and `run_portfolio_review` directly. Same engine, same
+gate, same ledger as the CLI — just structured output instead of a
+formatted table.
 
 ### Holdings input
 
 Drop the standard Zerodha `holdings.csv` (and optionally `holdings_mf.csv`)
 at the project root as before, **or** drop any broker export — csv, xls,
-xlsx or pdf, equity or mutual fund, any filename — into `holdings_inbox/`.
+xlsx, pdf, or txt, equity or mutual fund, any filename — into `holdings_inbox/`.
 Each file is sniffed and classified automatically; `factfolio status` /
-`report` / `dashboard` merge everything found there with the root files.
+`report` merge everything found there with the root files.
 
 ### Unattended grading (`factfolio cron`)
 

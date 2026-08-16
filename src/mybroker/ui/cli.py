@@ -1,7 +1,8 @@
 """Command-line interface.
 
-Every interface (CLI, dashboard, chat, cron) calls the same engine, so there is
-one implementation of the analysis and four ways to look at it.
+Every interface (CLI, chat, cron, MCP server) calls the same engine, so there
+is one implementation of the analysis and several ways to reach it — all of
+them plain terminal I/O or structured data, no GUI.
 """
 
 from __future__ import annotations
@@ -9,14 +10,26 @@ from __future__ import annotations
 import argparse
 import sys
 from datetime import date
-from pathlib import Path
 
 import anyio
+from rich.console import Console
+from rich.table import Table
 
 from mybroker.config import REPORTS_DIR, ensure_dirs
 from mybroker.portfolio.loader import load_portfolio
 from mybroker.portfolio.metrics import snapshot
 from mybroker.portfolio.policy import Policy
+
+# stdout: the actual thing someone ran a command to see (tables, reports).
+# stderr: chrome around that -- auth status, progress, "next steps" menus.
+# Piping `factfolio status > snapshot.txt` should capture the snapshot, not
+# also the "Running review..." line -- same split the old print(..., file=
+# sys.stderr) calls already made, just through Rich now for the parts that
+# render as tables or need a live-updating status line.
+console = Console()
+err_console = Console(stderr=True)
+
+_ACTION_STYLE = {"BUY": "green", "SELL": "red", "TRIM": "yellow", "HOLD": "cyan", "WATCH": "dim"}
 
 _POLICY_TEMPLATE = """\
 # Investment Policy
@@ -96,7 +109,7 @@ max_annual_turnover_pct: 25.0
 DIM, BOLD, RESET = "\033[2m", "\033[1m", "\033[0m"
 RED, YELLOW, GREEN = "\033[31m", "\033[33m", "\033[32m"
 
-SEVERITY_COLOR = {"critical": RED, "high": RED, "medium": YELLOW, "low": DIM}
+SEVERITY_STYLE = {"critical": "red", "high": "red", "medium": "yellow", "low": "dim"}
 
 
 def _auth_status_line() -> str:
@@ -122,65 +135,136 @@ def cmd_status(_args) -> int:
     pol = Policy.load()
     target, step = pol.current_core_target()
 
-    print(f"\n{BOLD}Portfolio{RESET}  {DIM}(from holdings.csv){RESET}")
-    print(f"  Invested       ₹{snap.total_invested:>14,.2f}")
-    print(f"  Current        ₹{snap.total_value:>14,.2f}")
-    pnl_col = GREEN if snap.total_pnl >= 0 else RED
-    print(f"  P&L            {pnl_col}₹{snap.total_pnl:>14,.2f}  "
-          f"({snap.total_pnl_pct:+.2f}%){RESET}")
+    pnl_style = "green" if snap.total_pnl >= 0 else "red"
+    console.print()
+    console.print("[bold]Portfolio[/bold] [dim](from holdings.csv)[/dim]")
+    console.print(f"  Invested       ₹{snap.total_invested:>14,.2f}")
+    console.print(f"  Current        ₹{snap.total_value:>14,.2f}")
+    console.print(
+        f"  P&L            [{pnl_style}]₹{snap.total_pnl:>14,.2f}  "
+        f"({snap.total_pnl_pct:+.2f}%)[/{pnl_style}]"
+    )
 
-    print(f"\n{BOLD}Allocation{RESET}")
-    print(f"  Core           {snap.core_pct:>6.1f}%   "
-          f"{DIM}target now {target:.0f}% ({step}); final {pol.core_min_pct:.0f}%{RESET}")
-    print(f"  Satellite      {snap.satellite_pct:>6.1f}%")
+    console.print()
+    console.print("[bold]Allocation[/bold]")
+    console.print(
+        f"  Core           {snap.core_pct:>6.1f}%   "
+        f"[dim]target now {target:.0f}% ({step}); final {pol.core_min_pct:.0f}%[/dim]"
+    )
+    console.print(f"  Satellite      {snap.satellite_pct:>6.1f}%")
 
-    print(f"\n{BOLD}Top positions{RESET}")
+    console.print()
+    positions = Table(title="Top positions", header_style="bold", show_edge=False)
+    positions.add_column("Symbol")
+    positions.add_column("Weight", justify="right")
+    positions.add_column("Value", justify="right")
+    positions.add_column("P&L", justify="right")
+    positions.add_column("Sector", style="dim")
     for w in snap.positions[:8]:
-        col = GREEN if w.pnl >= 0 else RED
-        print(f"  {w.key:<11} {w.weight_pct:>5.1f}%  ₹{w.value:>11,.0f}  "
-              f"{col}{w.pnl_pct:>+7.1f}%{RESET}  {DIM}{w.sector}{RESET}")
+        style = "green" if w.pnl >= 0 else "red"
+        positions.add_row(
+            w.key, f"{w.weight_pct:.1f}%", f"₹{w.value:,.0f}",
+            f"[{style}]{w.pnl_pct:+.1f}%[/{style}]", w.sector,
+        )
+    console.print(positions)
 
-    print(f"\n{BOLD}Sectors{RESET}")
+    console.print()
+    sectors = Table(title="Sectors", header_style="bold", show_edge=False)
+    sectors.add_column("Sector")
+    sectors.add_column("Weight", justify="right")
+    sectors.add_column("")
     for w in snap.sectors[:6]:
-        flag = f" {RED}← over {pol.max_sector_pct:.0f}% cap{RESET}" if (
-            w.weight_pct > pol.max_sector_pct) else ""
-        print(f"  {w.key:<22} {w.weight_pct:>5.1f}%{flag}")
+        over = w.weight_pct > pol.max_sector_pct
+        flag = f"[red]← over {pol.max_sector_pct:.0f}% cap[/red]" if over else ""
+        sectors.add_row(w.key, f"{w.weight_pct:.1f}%", flag)
+    console.print(sectors)
 
     breaches = pol.check(snap)
-    print(f"\n{BOLD}Policy{RESET}  {DIM}({len(breaches)} breaches){RESET}")
-    for b in breaches[:10]:
-        c = SEVERITY_COLOR.get(b.severity, "")
-        print(f"  {c}[{b.severity:<8}]{RESET} {b.subject:<22} "
-              f"{b.actual:>6.1f}% vs {b.limit:.0f}%")
-    if len(breaches) > 10:
-        print(f"  {DIM}… and {len(breaches) - 10} more{RESET}")
+    console.print()
+    console.print(f"[bold]Policy[/bold] [dim]({len(breaches)} breaches)[/dim]")
+    if breaches:
+        policy_table = Table(header_style="bold", show_edge=False)
+        policy_table.add_column("Severity")
+        policy_table.add_column("Subject")
+        policy_table.add_column("Actual", justify="right")
+        policy_table.add_column("Limit", justify="right")
+        for b in breaches[:10]:
+            style = SEVERITY_STYLE.get(b.severity, "")
+            policy_table.add_row(
+                f"[{style}]{b.severity}[/{style}]" if style else b.severity,
+                b.subject, f"{b.actual:.1f}%", f"{b.limit:.0f}%",
+            )
+        console.print(policy_table)
+        if len(breaches) > 10:
+            console.print(f"  [dim]… and {len(breaches) - 10} more[/dim]")
 
     pc, sc = snap.position_concentration, snap.sector_concentration
-    print(f"\n{BOLD}Concentration{RESET}")
-    print(f"  Position HHI   {pc.hhi:>6.0f}  ({pc.verdict})")
-    print(f"  Sector HHI     {sc.hhi:>6.0f}  ({sc.verdict})")
+    console.print()
+    console.print("[bold]Concentration[/bold]")
+    console.print(f"  Position HHI   {pc.hhi:>6.0f}  ({pc.verdict})")
+    console.print(f"  Sector HHI     {sc.hhi:>6.0f}  ({sc.verdict})")
     if sc.hhi > pc.hhi:
-        print(f"  {DIM}Sector HHI exceeds position HHI — position-level HHI is{RESET}")
-        print(f"  {DIM}correlation-blind, so the sector reading is the honest one.{RESET}")
+        console.print(
+            "  [dim]Sector HHI exceeds position HHI — position-level HHI is[/dim]"
+        )
+        console.print(
+            "  [dim]correlation-blind, so the sector reading is the honest one.[/dim]"
+        )
 
     for w in snap.warnings:
-        print(f"\n  {YELLOW}!{RESET} {w}")
-    print()
+        console.print(f"\n  [yellow]![/yellow] {w}")
+    console.print()
     return 0
+
+
+def _render_recommendations(recs: list) -> None:
+    """One row per recommendation actually logged this run — the real
+    BUY/SELL/HOLD decision and why, not a wall of markdown to scroll
+    through to find it. The full report (with everything else the agents
+    found) is still written to reports/ either way."""
+    if not recs:
+        console.print("[dim]No recommendations were logged this run.[/dim]")
+        return
+
+    table = Table(title="Recommendations", header_style="bold", show_lines=True)
+    table.add_column("Symbol", style="bold", no_wrap=True)
+    table.add_column("Action", no_wrap=True)
+    table.add_column("Conviction", no_wrap=True)
+    table.add_column("Rationale", max_width=56)
+    table.add_column("Key evidence", max_width=34, style="dim")
+
+    for r in recs:
+        style = _ACTION_STYLE.get(r.action, "")
+        action = f"[{style}]{r.action}[/{style}]" if style else r.action
+        evidence = "\n".join(
+            f"{e.get('tool', '?')}.{e.get('field', '?')}={e.get('value', '?')}"
+            for e in (r.evidence or [])[:3]
+        )
+        table.add_row(r.symbol, action, r.conviction, r.rationale, evidence)
+
+    console.print(table)
 
 
 def cmd_report(args) -> int:
     """Full agent-generated review, written to reports/YYYY-MM-DD.md."""
     from mybroker.agents.orchestrator import run_review
+    from mybroker.ledger import recommendations_for_run
 
     ensure_dirs()
-    print(_auth_status_line(), file=sys.stderr)
-    print(f"{DIM}Running review… this takes a few minutes.{RESET}", file=sys.stderr)
+    err_console.print(_auth_status_line())
 
-    result = anyio.run(run_review)
+    # A multi-minute silent wait reads as "did this hang?" — the live status
+    # line (driven by run_review's on_event callback, one update per tool
+    # call / agent dispatch / text chunk) is the difference between that and
+    # visible, ongoing progress, the same idea as Claude Code's own spinner.
+    with err_console.status("[dim]starting review…[/dim]", spinner="dots") as status:
+        def on_event(text: str) -> None:
+            status.update(f"[dim]{text}[/dim]")
+
+        result = anyio.run(run_review, None, on_event)
 
     if not result.report:
-        print(f"{RED}No report produced.{RESET}", file=sys.stderr)
+        err_console.print("[red]No report produced.[/red]")
         return 1
 
     out = REPORTS_DIR / f"{date.today().isoformat()}.md"
@@ -193,14 +277,19 @@ def cmd_report(args) -> int:
     )
     out.write_text(result.report + footer, encoding="utf-8")
 
-    print(f"\n{GREEN}✓{RESET} {out}", file=sys.stderr)
-    print(f"  {DIM}run {result.run_id} · {result.turns} turns · "
-          f"{len(result.tool_calls)} tool calls · {result.duration_s:.0f}s"
-          + (f" · ${result.cost_usd:.4f}" if result.cost_usd else "") + f"{RESET}",
-          file=sys.stderr)
+    err_console.print(f"\n[green]✓[/green] {out}")
+    err_console.print(
+        f"  [dim]run {result.run_id} · {result.turns} turns · "
+        f"{len(result.tool_calls)} tool calls · {result.duration_s:.0f}s"
+        + (f" · ${result.cost_usd:.4f}" if result.cost_usd else "") + "[/dim]"
+    )
+
+    console.print()
+    _render_recommendations(recommendations_for_run(result.run_id))
 
     if args.show:
-        print(result.report)
+        console.print()
+        console.print(result.report)
     return 0
 
 
@@ -208,28 +297,31 @@ def cmd_welcome(args) -> int:
     """No subcommand given — what someone who downloaded the standalone
     executable and double-clicked it actually experiences, as opposed to
     someone who already knows to type `factfolio status`. Runs first-time
-    setup if needed, then goes straight to the one thing that's an actual
-    UI (the dashboard) instead of a bare usage error. Since a double-clicked
-    console window on Windows closes itself the instant the process exits,
-    this also prints a command menu and waits for a keypress afterward
-    rather than vanishing before anyone can read it.
+    setup if needed, shows an instant status snapshot if there's already a
+    portfolio to show one for, and always prints the numbered next step —
+    plain terminal output, identical on every platform, never a GUI. Since a
+    double-clicked console window on Windows closes itself the instant the
+    process exits, this also prints a command menu and waits for a keypress
+    afterward rather than vanishing before anyone can read it.
     """
-    from mybroker.config import POLICY_FILE
+    from mybroker.config import HOLDINGS_EQUITY, HOLDINGS_INBOX_DIR, POLICY_FILE
 
-    print(f"{BOLD}FactFolio{RESET}  {DIM}— no command given, opening the dashboard{RESET}\n",
-          flush=True)
+    print(f"{BOLD}FactFolio{RESET}\n", flush=True)
 
-    if not POLICY_FILE.exists():
-        cmd_init(args)
+    first_run = not POLICY_FILE.exists()
+    cmd_init(args)  # idempotent — safe whether this is a first run or not
+
+    holdings_ready = HOLDINGS_EQUITY.exists() or any(HOLDINGS_INBOX_DIR.glob("*"))
+    if holdings_ready and not first_run:
         print()
-
-    cmd_dashboard(args)  # blocks until the user stops it (Ctrl+C)
+        cmd_status(args)
 
     print(f"\n{BOLD}Other things you can run:{RESET}")
     print(f"  factfolio status      {DIM}instant snapshot, no LLM{RESET}")
     print(f"  factfolio report      {DIM}full multi-agent review{RESET}")
     print(f"  factfolio chat        {DIM}terminal Q&A{RESET}")
     print(f"  factfolio validate    {DIM}resolve tickers — do this before report/chat{RESET}")
+    print(f"  factfolio mcp         {DIM}run as an MCP server for other tools{RESET}")
     print(f"  factfolio --help      {DIM}everything{RESET}")
 
     # Only pause for a frozen build in an actual interactive console — never
@@ -271,7 +363,7 @@ def cmd_init(_args) -> int:
     if not HOLDINGS_EQUITY.exists() and not any(HOLDINGS_INBOX_DIR.glob("*")):
         steps.append(
             f"Add your holdings: export from your broker and place it at "
-            f"{HOLDINGS_EQUITY}, or drop any csv/xls/xlsx/pdf export into "
+            f"{HOLDINGS_EQUITY}, or drop any csv/xls/xlsx/pdf/txt export into "
             f"{HOLDINGS_INBOX_DIR}/."
         )
     steps.append(
@@ -292,51 +384,14 @@ def cmd_validate(_args) -> int:
     return validate_main()
 
 
-_DASHBOARD_PORT = 8501  # Streamlit's own default — pinned explicitly, see below.
+def cmd_mcp(_args) -> int:
+    """Run as a standalone MCP server (stdio) for external clients — VS
+    Code's Claude extension, Claude Desktop, or any other MCP-aware tool or
+    agent. Point a client at `factfolio mcp`; nothing to configure, no port
+    to pick. See mcp_server.py for the exposed tools."""
+    from mybroker.mcp_server import run as run_mcp_server
 
-
-def cmd_dashboard(_args) -> int:
-    """Launch the Streamlit dashboard. Same engine as `status`, visual."""
-    dashboard_path = Path(__file__).with_name("dashboard.py")
-    print(f"{DIM}Launching dashboard… (Ctrl+C to stop){RESET}", file=sys.stderr)
-
-    if getattr(sys, "frozen", False):
-        # A PyInstaller build: sys.executable IS this frozen binary, not a
-        # real Python interpreter, so `sys.executable -m streamlit run ...`
-        # below can't work (it would just re-invoke this same CLI). Streamlit
-        # has no PyInstaller hook of its own, so the build (see
-        # packaging/factfolio.spec) bundles dashboard.py as a literal data
-        # file and streamlit's own static assets via collect_all("streamlit")
-        # — bootstrap.run() is what `streamlit run` itself calls, in-process.
-        from streamlit.web import bootstrap
-
-        # `server.port` (what the server actually binds) and
-        # `browser.serverPort` (what URL it prints/opens) are independent
-        # Streamlit settings, normally kept in sync by whoever wrote a
-        # config.toml for a real deployment. Passing {} here left both to
-        # fall back to whatever's in the ambient shell environment — on at
-        # least one real machine that meant a leftover STREAMLIT_* (or a
-        # generic PORT=3000 from an unrelated JS project) pointed the
-        # *browser* at :3000 while the server kept listening on :8501,
-        # producing a silent "this site can't be reached" with a perfectly
-        # healthy server underneath. A downloaded executable can't assume
-        # anything about what else is set in someone's shell, so both are
-        # pinned to the same value explicitly — this always wins over env
-        # vars, same precedence as an equivalent `streamlit run --server.port`
-        # CLI flag would.
-        bootstrap.run(str(dashboard_path), False, [], {
-            "server.port": _DASHBOARD_PORT,
-            "browser.serverPort": _DASHBOARD_PORT,
-        })
-        return 0
-
-    import subprocess
-
-    return subprocess.call([
-        sys.executable, "-m", "streamlit", "run", str(dashboard_path),
-        "--server.port", str(_DASHBOARD_PORT),
-        "--browser.serverPort", str(_DASHBOARD_PORT),
-    ])
+    return run_mcp_server()
 
 
 def cmd_estimate_dates(_args) -> int:
@@ -502,8 +557,8 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("validate", help="re-resolve tickers (gate)"
                    ).set_defaults(func=cmd_validate)
 
-    sub.add_parser("dashboard", help="launch the Streamlit dashboard (no LLM)"
-                   ).set_defaults(func=cmd_dashboard)
+    sub.add_parser("mcp", help="run as an MCP server (stdio) for other tools/agents"
+                   ).set_defaults(func=cmd_mcp)
 
     sub.add_parser("estimate-dates",
                     help="tentative purchase-date estimation from price history (no LLM)"

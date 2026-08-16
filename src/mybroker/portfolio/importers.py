@@ -5,8 +5,8 @@ CSV (Zerodha's own export, or a hand-built MF CSV with recognisable headers)
 and are deliberately strict — they are what the golden-value tests pin. Real
 broker statements dropped into an inbox are messier: the data table is buried
 under account/PII headers and disclaimer paragraphs, ends with a "Total" row,
-column names vary by broker, and the file itself may be CSV, XLS, XLSX or
-PDF.
+column names vary by broker, and the file itself may be CSV, XLS, XLSX,
+PDF, or TXT.
 
 This module handles that mess as an ADDITIVE source, not a replacement:
 
@@ -31,7 +31,7 @@ from typing import Literal
 from mybroker.config import HOLDINGS_INBOX_DIR, symbol_meta
 from mybroker.portfolio.loader import EquityPosition, MFPosition, _num
 
-SUPPORTED_SUFFIXES = {".csv", ".xls", ".xlsx", ".pdf"}
+SUPPORTED_SUFFIXES = {".csv", ".xls", ".xlsx", ".pdf", ".txt"}
 
 Grid = list[list[str]]
 Kind = Literal["equity", "mf"]
@@ -93,6 +93,22 @@ def _read_csv_grid(path: Path) -> Grid:
         return [list(row) for row in csv.reader(fh)]
 
 
+def _read_txt_grid(path: Path) -> Grid:
+    """.txt has no fixed delimiter across brokers — some export plain
+    comma-separated data under a .txt extension, others tab- or
+    semicolon-separated. Sniff it (falling back to comma, the commonest
+    case) rather than assuming one, so both actually get parsed instead of
+    silently landing everything in a single column."""
+    import csv
+
+    text = path.read_text(encoding="utf-8-sig")
+    try:
+        dialect = csv.Sniffer().sniff(text[:4096], delimiters=",\t;|")
+    except csv.Error:
+        dialect = csv.excel  # comma-delimited default
+    return [list(row) for row in csv.reader(text.splitlines(), dialect=dialect)]
+
+
 def _read_excel_grid(path: Path) -> Grid:
     import contextlib
     import io
@@ -131,6 +147,8 @@ def read_grid(path: Path) -> Grid:
         return _read_excel_grid(path)
     if suffix == ".pdf":
         return _read_pdf_grid(path)
+    if suffix == ".txt":
+        return _read_txt_grid(path)
     raise ValueError(
         f"{path}: unsupported format {suffix!r}. Supported: "
         f"{', '.join(sorted(SUPPORTED_SUFFIXES))}."

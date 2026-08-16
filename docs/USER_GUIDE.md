@@ -10,8 +10,7 @@ shipped vs. not, see [`MILESTONES.md`](MILESTONES.md).
   manager this project uses — `curl -LsSf https://astral.sh/uv/install.sh | sh`)
 - **A Claude login or API key**, for the two commands that use the LLM
   (`report`, `chat`) — see [§4](#4-authentication). Everything else
-  (`status`, `validate`, `cron`, `estimate-dates`, the dashboard's Overview
-  tab) needs neither.
+  (`status`, `validate`, `cron`, `estimate-dates`) needs neither.
 - **A holdings export** from your broker (Zerodha Kite works out of the
   box; anything else works via `holdings_inbox/`, see [§3](#3-add-your-holdings))
 
@@ -48,7 +47,7 @@ Qty., Avg. cost, LTP, Invested, Cur. val, P&L, Net chg., Day chg.` — that's
 exactly what Kite's own export produces, nothing to edit.
 
 **Anything else — any broker, any format:** drop the file into
-`holdings_inbox/`, unmodified. Supported formats: **csv, xls, xlsx, pdf**.
+`holdings_inbox/`, unmodified. Supported formats: **csv, xls, xlsx, pdf, txt**.
 It's sniffed automatically — header row located by keyword, classified as
 equity or mutual-fund, parsed regardless of the exact column names your
 broker used. A file it can't confidently classify raises an error naming
@@ -94,8 +93,7 @@ doesn't get re-checked on every run.
 
 ## 4. Authentication
 
-`factfolio report` and `factfolio chat` (terminal and the dashboard's Chat
-tab) need Claude. Nothing else does.
+`factfolio report` and `factfolio chat` need Claude. Nothing else does.
 
 - **Default — local login.** Run `claude login` once (Pro/Max subscription
   or Anthropic Console) and every LLM command here just works — this
@@ -131,9 +129,9 @@ with it on the next run.
 
 ```bash
 uv run factfolio status           # instant snapshot — weights, breaches, HHI. No LLM.
-uv run factfolio report           # full multi-agent review → reports/YYYY-MM-DD.md
-uv run factfolio dashboard        # Streamlit UI — charts + a chat tab
+uv run factfolio report           # full multi-agent review → reports/YYYY-MM-DD.md + a table in your terminal
 uv run factfolio chat             # terminal Q&A, one agent, cheaper/faster than report
+uv run factfolio mcp              # run as an MCP server for other tools/agents
 uv run factfolio estimate-dates   # tentative purchase-date estimation for tax calc
 uv run factfolio cron             # grade past recommendations against real prices
 ```
@@ -143,7 +141,10 @@ current. Good for "did anything change since yesterday."
 
 **`report`** is the deep pass: a 7-agent team (market regime, portfolio
 audit, per-stock research, tax costing, risk, and a mandatory adversarial
-review of every draft) producing a dated Markdown report in `reports/`.
+review of every draft) producing a dated Markdown report in `reports/`, plus
+a table right in your terminal — symbol, action, conviction, rationale, key
+evidence — for every recommendation that survived the gate, with a live
+status line while it runs so a multi-minute wait doesn't look like a hang.
 Takes a few minutes and costs real tokens — see
 [`ARCHITECTURE.md`](ARCHITECTURE.md#multi-agent-orchestration-factfolio-report)
 for what each agent actually does. Every BUY/SELL/TRIM/WATCH it finalises
@@ -155,8 +156,12 @@ direct tool access, same evidence-only discipline, but it can't log a
 formal recommendation (that only happens through `report`, where the
 adversarial-review step is mandatory).
 
-**`dashboard`** gives you the same numbers as `status` as charts, plus a
-Chat tab using the same engine as the terminal `chat` command.
+**`mcp`** runs the same engine as a standalone
+[MCP](https://modelcontextprotocol.io) server over stdio, for external
+clients — the VS Code Claude extension, Claude Desktop, another agent — to
+call directly: `portfolio_status`, `validate_tickers`,
+`run_portfolio_review`. Structured output instead of a formatted table,
+otherwise identical.
 
 ### Reading a report
 
@@ -213,7 +218,6 @@ run `report` when you actually want a fresh review.
 | `factfolio validate` reports unresolved symbols | The symbol's real ticker isn't in its `candidates` list, or it's been renamed/delisted — check the company's current NSE/BSE symbol and add it as a candidate |
 | `report`/`chat` hang or fail with an auth error | Run `claude login`, or check `ANTHROPIC_API_KEY` is valid — see §4 |
 | A number in `holdings_inbox/` didn't parse | The importer couldn't find a header row it recognised — check the file has "Instrument"/"Qty" (equity) or "Folio"/"Scheme Name" (mutual fund) somewhere in it; PDF import in particular is less proven than csv/xls, see `MILESTONES.md` |
-| Dashboard chat tab errors | Same auth requirement as `chat` — the Overview tab works without any LLM setup, only the Chat tab needs it |
 
 ## 10. What this tool is not
 

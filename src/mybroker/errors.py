@@ -1,5 +1,5 @@
 """Shared error handling for every entry point (CLI commands, the chat REPL,
-the dashboard).
+the MCP server).
 
 Before this module existed, an uncaught exception anywhere in a command
 dumped a raw Python traceback straight to the user's terminal — technically
