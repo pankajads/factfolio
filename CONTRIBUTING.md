@@ -21,6 +21,8 @@
 
 ## One-time repo setup
 
+**Status: done** (applied 2026-08-16). Left here for reference — e.g. if
+branch protection ever needs to be recreated on a fork or a renamed repo.
 Needs at least one CI run to already exist (so GitHub knows the `test`
 check to select) and `gh auth login` as the repo owner:
 
@@ -28,12 +30,15 @@ check to select) and `gh auth login` as the repo owner:
 ```bash
 gh api repos/pankajads/factfolio/branches/main/protection -X PUT \
   -H "Accept: application/vnd.github+json" \
-  -f 'required_status_checks[strict]=true' \
+  -F 'required_status_checks[strict]=true' \
   -f 'required_status_checks[contexts][]=test' \
   -F 'enforce_admins=true' \
-  -f 'required_pull_request_reviews[required_approving_review_count]=0' \
+  -F 'required_pull_request_reviews[required_approving_review_count]=0' \
   -F 'restrictions=null'
 ```
+(`-F`, not `-f`, for `strict` and `required_approving_review_count` — `-f`
+sends a string, and GitHub's schema rejects `"true"`/`"0"` as a boolean/
+integer. `-f` is correct for `contexts[]`, a real string array.)
 `required_approving_review_count=0` is deliberate: it still forces every
 change through a PR (the `required_pull_request_reviews` object being
 present at all is what blocks direct pushes — `null` would not), just
