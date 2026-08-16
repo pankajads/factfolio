@@ -28,7 +28,9 @@ from claude_agent_sdk import (
     HookMatcher,
     ResultMessage,
     TextBlock,
+    ToolUseBlock,
 )
+from rich.console import Console
 
 from mybroker.config import MODEL_WORKER, PROJECT_ROOT
 from mybroker.security.hooks import (
@@ -41,6 +43,8 @@ from mybroker.tools.server import ALL_TOOLS, build_server
 
 DIM, BOLD, RESET = "\033[2m", "\033[1m", "\033[0m"
 CYAN, RED = "\033[36m", "\033[31m"
+
+err_console = Console(stderr=True)
 
 # Every read/compute tool except log_recommendation — chat answers questions,
 # it does not create ledger-tracked recommendations. review_recommendation_
@@ -152,13 +156,22 @@ async def run_chat_repl() -> int:
 
             await client.query(text)
 
+            # Tool calls (a quote lookup, a tax-impact calc, ...) happen
+            # before any text — without this, the terminal just sits blank
+            # for however long that takes. Cleared the moment real text
+            # starts streaming in, same idea as Claude Code's own spinner.
             cost = None
+            status = err_console.status("[dim]thinking…[/dim]", spinner="dots")
+            status.start()
             try:
                 async for message in client.receive_response():
                     if isinstance(message, AssistantMessage):
                         for block in message.content:
                             if isinstance(block, TextBlock):
+                                status.stop()
                                 print(block.text, end="", flush=True)
+                            elif isinstance(block, ToolUseBlock):
+                                status.update(f"[dim]tool: {block.name}[/dim]")
                     elif isinstance(message, ResultMessage):
                         cost = message.total_cost_usd
             except Exception as exc:
@@ -172,6 +185,8 @@ async def run_chat_repl() -> int:
                 if log_file:
                     print(f"  {DIM}Full traceback: {log_file}{RESET}", file=sys.stderr)
                 continue
+            finally:
+                status.stop()
             print()
             if cost:
                 print(f"{DIM}(${cost:.4f}){RESET}", file=sys.stderr)

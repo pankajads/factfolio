@@ -275,6 +275,46 @@ tool here outputs a buy/sell verdict or a price forecast.
   `test_data.py`, plus `@pytest.mark.live` integration tests for both
   (skipped by default, run with `pytest -m live`).
 
+## M6 — Dashboard removed; CLI-only, plus an MCP server
+
+**Status: done** (2026-08-16). The M4 Streamlit dashboard is gone —
+`ui/dashboard.py` deleted, `streamlit`/`plotly` dropped as dependencies,
+`cmd_dashboard` removed from `ui/cli.py`. Cause: real users hit a chain of
+frozen-build-specific Streamlit bugs in production (wrong dev-mode
+detection under PyInstaller's temp-extraction path, a wildcard network
+bind exposing the dashboard to the whole LAN, and a filesystem-watcher
+CPU-starvation bug pinning the process near 100% until it stopped
+responding) — each one root-caused and fixed in turn, but the pattern made
+clear that a GUI toolkit was the wrong shape for what's fundamentally a
+terminal tool, not that Streamlit itself is unusable. factfolio is CLI-only
+now, on principle, not just because the bugs got fixed.
+
+- **`ui/cli.py` no-args behaviour** (`cmd_welcome`): first-run setup if
+  needed, an instant `status` snapshot if there's already a portfolio to
+  show, always the numbered next-step menu — plain terminal output,
+  identical on every platform, no window that can vanish or fail to load.
+- **Rich-rendered output**: `status` and the post-`report` recommendations
+  view (symbol / action / conviction / rationale / key evidence, straight
+  from `ledger.py: recommendations_for_run()`) are now proper tables via
+  `rich`, not a wall of markdown to search through for the actual decision.
+- **Live progress**: `run_review()` (`agents/orchestrator.py`) takes an
+  optional `on_event` callback, fired once per tool call / subagent
+  dispatch / text chunk; `factfolio report`'s status line and `factfolio
+  chat`'s "thinking…" indicator are both driven by it, so a multi-minute
+  or multi-second wait reads as progress, not a hang. `on_event` is
+  optional specifically so nothing else (tests, the MCP server) has to
+  care about it.
+- **`factfolio mcp`** (`mcp_server.py`, new): a standalone MCP server over
+  stdio — distinct from `tools/server.py`, which stays in-process/internal
+  to the orchestrator's own agent runs — exposing `portfolio_status`,
+  `validate_tickers`, and `run_portfolio_review` to external clients (VS
+  Code's Claude extension, Claude Desktop, another agent). Verified with a
+  real `mcp` Python client over stdio: handshake, `list_tools`, and a live
+  `portfolio_status` call against real holdings, not just read against the
+  source.
+- `packaging/factfolio.spec` simplified accordingly — no more Streamlit
+  static-asset collection, the single most fragile part of the old build.
+
 ## Remaining gaps
 
 - **`compute_overlap` is still honestly blocked.** MF holdings are now real

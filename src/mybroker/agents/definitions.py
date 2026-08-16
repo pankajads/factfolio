@@ -140,7 +140,7 @@ You report on the mutual-fund side of the portfolio.
 
 Call get_portfolio_snapshot and read `totals.has_mutual_funds`, `totals.mf_value`,
 and the `warnings` list — MF holdings are loaded from holdings_mf.csv and/or
-any file in holdings_inbox/ (any supported format: csv, xls, xlsx, pdf), so
+any file in holdings_inbox/ (any supported format: csv, xls, xlsx, pdf, txt), so
 `has_mutual_funds` reflects real data when present, not a placeholder.
 
 Call compute_overlap once and report its result AS GIVEN — it currently

@@ -72,25 +72,26 @@ e.g. PyPI has v0.2.0 but the GitHub Release doesn't, or vice versa, because
 
 ## Why an executable can still need internet + a login
 
-Skimming the artifacts you'll see three ~130MB+ single-file binaries (built
-with PyInstaller, includes the interpreter and every dependency — pandas,
-numpy, scipy, streamlit, plotly, and the rest). They remove the need to
-install Python or clone the repo. They do **not** remove the need to
-install and authenticate the separate `claude` CLI (`claude login` or
-`ANTHROPIC_API_KEY`) — `factfolio report` and `factfolio chat` shell out to
-it via `claude_agent_sdk`, and no packaging choice here changes that. Keep
-that expectation explicit wherever these binaries are advertised.
+Skimming the artifacts you'll see three single-file binaries (built with
+PyInstaller, includes the interpreter and every dependency — pandas, numpy,
+scipy, and the rest — no GUI toolkit; factfolio is a terminal tool). They
+remove the need to install Python or clone the repo. They do **not** remove
+the need to install and authenticate the separate `claude` CLI (`claude
+login` or `ANTHROPIC_API_KEY`) — `factfolio report` and `factfolio chat`
+shell out to it via `claude_agent_sdk`, and no packaging choice here changes
+that. Keep that expectation explicit wherever these binaries are advertised.
 
 ## What's validated vs. assumed
 
 The PyInstaller build (`packaging/factfolio.spec`) was built and run
 end-to-end on macOS during development of this pipeline — CLI, `status`
-against a real portfolio, and the Streamlit dashboard (`bootstrap.run()` in
-the frozen branch of `cmd_dashboard`, since `sys.executable -m streamlit`
-can't work inside a frozen binary) all confirmed working. Linux and Windows
-are **not** locally validated — only what the matrix build's own smoke test
-in `release.yml` confirms (`--version` + `init`, not the full app, and
-specifically not the dashboard, which is the most PyInstaller-fragile
-piece). Watch the first real release's `build-executables` job closely, and
-manually try `factfolio dashboard` on a Linux/Windows machine soon after —
-don't assume the smoke test caught everything a human would notice.
+against a real portfolio, and `mcp` (a real MCP client connected over stdio,
+listed tools, called one) all confirmed working. Linux and Windows are
+**not** locally validated — only what the matrix build's own smoke test in
+`release.yml` confirms (`--version` + `init`). Watch the first real
+release's `build-executables` job closely, and try a couple of real commands
+on a Linux/Windows machine soon after — don't assume the smoke test caught
+everything a human would notice. (An earlier version of this build also
+bundled a Streamlit dashboard — removed entirely, along with the frozen-
+build-specific class of bugs it turned out to cause; see git history if
+you're curious.)

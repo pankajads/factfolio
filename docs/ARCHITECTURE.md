@@ -24,12 +24,12 @@ core, with the LLM only ever touching the core through named tools.
 
 ```mermaid
 flowchart TB
-    subgraph Interfaces["Four interfaces, one engine"]
+    subgraph Interfaces["Five interfaces, one engine — all terminal/stdio, no GUI"]
         CLI["factfolio status\n(instant, no LLM)"]
         Report["factfolio report\n(multi-agent review)"]
-        Chat["factfolio chat /\ndashboard Chat tab"]
+        Chat["factfolio chat"]
         Cron["factfolio cron\n(no LLM)"]
-        Dash["factfolio dashboard\nOverview tab"]
+        Mcp["factfolio mcp\n(external clients, stdio)"]
     end
 
     subgraph Engine["Deterministic core (portfolio/, tax.py, ledger.py, scoring.py)"]
@@ -56,7 +56,8 @@ flowchart TB
     end
 
     CLI --> Metrics
-    Dash --> Metrics
+    Mcp --> Metrics
+    Mcp --> Orchestrator
     Report --> Orchestrator
     Chat --> ChatEngine
     Cron --> Scoring
@@ -81,8 +82,8 @@ flowchart TB
     Scoring --> Ledger
 ```
 
-**Read it this way:** the four ways you touch the system (CLI, report,
-chat, cron) all sit on top of the *same* deterministic core — nothing about
+**Read it this way:** the five ways you touch the system (CLI, report, chat,
+cron, mcp) all sit on top of the *same* deterministic core — nothing about
 weights, breaches, tax, or grading changes depending on which interface you
 used. The agent layer is a thin reasoning shell wrapped around that core,
 never a replacement for it. Data providers are the only part that talks to
@@ -171,8 +172,8 @@ so too, in "Where this analysis is weak."
 
 ## Chat: the lighter path
 
-`factfolio chat` and the dashboard's Chat tab both run `agents/chat.py`,
-deliberately **not** the orchestrator:
+`factfolio chat` runs `agents/chat.py`, deliberately **not** the
+orchestrator:
 
 | | `report` (orchestrator) | `chat` |
 |---|---|---|
@@ -188,12 +189,10 @@ for that. This keeps the provenance discipline meaningful: the only path
 that produces a tracked, gradeable recommendation also carries the mandatory
 adversarial-review instruction.
 
-The dashboard's Chat tab reuses the exact same `build_options()` from
-`agents/chat.py`. Since Streamlit reruns the whole script on every
-interaction but the SDK client wants one persistent connection across a
-conversation, that tab runs a background thread with its own asyncio event
-loop (held in `st.session_state`), and dispatches each turn onto it with
-`run_coroutine_threadsafe`.
+A "thinking…" status line covers the gap between sending a message and the
+first token of the reply — cleared the instant real text starts streaming,
+updated with the tool name in between (`get_quote`, `compute_tax_impact`,
+...) so a multi-second wait for a tool call never reads as a hang.
 
 ## Security & guardrails
 
@@ -259,7 +258,7 @@ src/mybroker/
 ├── config.py              # every path, in one place — security hooks depend on this
 ├── portfolio/
 │   ├── loader.py           # strict root-file parsing + load_portfolio() merge
-│   ├── importers.py        # permissive holdings_inbox/ parsing (csv/xls/xlsx/pdf)
+│   ├── importers.py        # permissive holdings_inbox/ parsing (csv/xls/xlsx/pdf/txt)
 │   ├── metrics.py           # weights, HHI, core/satellite — all deterministic
 │   ├── policy.py            # investment_policy.md → breach detection
 │   ├── risk.py               # volatility, drawdown, beta
@@ -281,9 +280,10 @@ src/mybroker/
 │   ├── orchestrator.py       # factfolio report — multi-agent, adversarial review
 │   └── chat.py                # factfolio chat — single agent, no report gate
 ├── tools/server.py         # 15 MCP tools — the ONLY way agents touch real data
+├── mcp_server.py           # STANDALONE MCP server (factfolio mcp) for external clients —
+│                           # distinct from tools/server.py, which is in-process/internal only
 └── ui/
-    ├── cli.py                # status / report / validate / dashboard / chat / cron / estimate-dates
-    └── dashboard.py           # Streamlit — Overview (no LLM) + Chat tab
+    └── cli.py                # status / report / validate / mcp / chat / cron / estimate-dates
 ```
 
 ## Design principles, restated as decisions
@@ -305,6 +305,6 @@ src/mybroker/
   with evidence instead of flipped. Every one of these defaults costs the
   user nothing to override with real data.
 - **One engine, many views.** `factfolio status`, `report`, `chat`, `cron`,
-  and the dashboard all compute from the same `portfolio/metrics.py` and
+  and `mcp` all compute from the same `portfolio/metrics.py` and
   `portfolio/policy.py` — there is exactly one implementation of "what does
   this portfolio look like," not one per interface.

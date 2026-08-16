@@ -1,6 +1,6 @@
 [project]
 name = "factfolio"
-version = "0.1.3"
+version = "0.2.0"
 description = "FactFolio — open-source, evidence-based portfolio advisory for Indian equity & mutual funds. Every number traceable to a tool call, never a guess."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -33,9 +33,13 @@ dependencies = [
     # Config / validation
     "pydantic>=2.9",
     "pyyaml>=6.0",
-    # UI
-    "streamlit>=1.48",
-    "plotly>=5.24",
+    # Terminal UI: tables, live progress — no GUI, no browser, every platform
+    # gets the identical output.
+    "rich>=13.9",
+    # Standalone MCP server (factfolio mcp) for external clients — VS Code,
+    # Claude Desktop, other agents. Already a transitive dep of
+    # claude-agent-sdk; declared directly since we import it ourselves now.
+    "mcp>=1.2",
     "xlrd>=2.0.2",
     "openpyxl>=3.1.5",
     "pdfplumber>=0.11.10",

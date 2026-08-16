@@ -319,7 +319,7 @@ def load_portfolio(
 ) -> Portfolio:
     """Load the complete portfolio: the legacy holdings.csv/holdings_mf.csv
     pair, plus (by default) every file dropped in holdings_inbox/ — any
-    format (csv, xls, xlsx, pdf), equity or mutual fund, sniffed and
+    format (csv, xls, xlsx, pdf, txt), equity or mutual fund, sniffed and
     classified by `portfolio.importers`.
 
     Equity data is required overall, but no longer strictly from
@@ -363,7 +363,7 @@ def load_portfolio(
     if not equity:
         raise FileNotFoundError(
             f"No equity holdings found. Export from Kite → Holdings → download "
-            f"to {HOLDINGS_EQUITY}, or drop any csv/xls/xlsx/pdf export into "
+            f"to {HOLDINGS_EQUITY}, or drop any csv/xls/xlsx/pdf/txt export into "
             f"{HOLDINGS_INBOX_DIR}/."
         )
 
