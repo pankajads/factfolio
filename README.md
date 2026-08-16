@@ -98,6 +98,26 @@ Single file, every dependency baked in (~130MB) — nothing else to install.
 Still needs the `claude` CLI separately for `report`/`chat` — see
 [Authentication](#authentication); no packaging choice removes that.
 
+> **Your OS will warn you before running it.** These builds aren't
+> code-signed (a paid certificate per platform, ~$70–400/yr Windows,
+> $99/yr Apple — not in place yet), so this is expected, not a sign
+> anything's wrong:
+> - **macOS:** *"Apple could not verify … is free of malware"* — the
+>   dependable fix is Terminal, since a right-click→Open bypass often
+>   isn't even offered for this on current macOS:
+>   ```bash
+>   xattr -d com.apple.quarantine ./factfolio-macos-arm64
+>   ```
+>   then run it as above. (GUI alternative: System Settings → Privacy &
+>   Security → **Open Anyway**, after one blocked attempt.)
+> - **Windows:** SmartScreen — click **More info**, then **Run anyway**.
+> - **Linux:** no equivalent gate — `chmod +x` above is normally all you
+>   need. (A file manager may prompt to "trust" it on double-click; running
+>   from a terminal, as shown, skips that.)
+>
+> Full explanation and the [`uvx`](#installing) alternative that sidesteps
+> this entirely: [wiki FAQ](../../wiki/FAQ).
+
 **3. Clone + dev setup — for contributing or reading/customising the code.**
 ```bash
 uv venv --python 3.12
