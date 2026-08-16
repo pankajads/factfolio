@@ -140,6 +140,14 @@ def load_ledger() -> list[LedgerEntry]:
     return out
 
 
+def recommendations_for_run(run_id: str) -> list[LedgerEntry]:
+    """Every recommendation logged during one specific review run — what the
+    CLI's post-report table and the MCP server's run_portfolio_review both
+    render, so a run's terminal output and its structured API response are
+    always built from the exact same read."""
+    return [e for e in load_ledger() if e.run_id == run_id]
+
+
 def due_for_review(today: date | None = None) -> list[LedgerEntry]:
     """Recommendations whose review_after date has passed and have no
     recorded outcome yet — the M5 scoring loop's work queue."""
