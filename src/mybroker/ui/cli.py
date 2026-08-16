@@ -292,6 +292,9 @@ def cmd_validate(_args) -> int:
     return validate_main()
 
 
+_DASHBOARD_PORT = 8501  # Streamlit's own default — pinned explicitly, see below.
+
+
 def cmd_dashboard(_args) -> int:
     """Launch the Streamlit dashboard. Same engine as `status`, visual."""
     dashboard_path = Path(__file__).with_name("dashboard.py")
@@ -307,14 +310,33 @@ def cmd_dashboard(_args) -> int:
         # — bootstrap.run() is what `streamlit run` itself calls, in-process.
         from streamlit.web import bootstrap
 
-        bootstrap.run(str(dashboard_path), False, [], {})
+        # `server.port` (what the server actually binds) and
+        # `browser.serverPort` (what URL it prints/opens) are independent
+        # Streamlit settings, normally kept in sync by whoever wrote a
+        # config.toml for a real deployment. Passing {} here left both to
+        # fall back to whatever's in the ambient shell environment — on at
+        # least one real machine that meant a leftover STREAMLIT_* (or a
+        # generic PORT=3000 from an unrelated JS project) pointed the
+        # *browser* at :3000 while the server kept listening on :8501,
+        # producing a silent "this site can't be reached" with a perfectly
+        # healthy server underneath. A downloaded executable can't assume
+        # anything about what else is set in someone's shell, so both are
+        # pinned to the same value explicitly — this always wins over env
+        # vars, same precedence as an equivalent `streamlit run --server.port`
+        # CLI flag would.
+        bootstrap.run(str(dashboard_path), False, [], {
+            "server.port": _DASHBOARD_PORT,
+            "browser.serverPort": _DASHBOARD_PORT,
+        })
         return 0
 
     import subprocess
 
-    return subprocess.call(
-        [sys.executable, "-m", "streamlit", "run", str(dashboard_path)]
-    )
+    return subprocess.call([
+        sys.executable, "-m", "streamlit", "run", str(dashboard_path),
+        "--server.port", str(_DASHBOARD_PORT),
+        "--browser.serverPort", str(_DASHBOARD_PORT),
+    ])
 
 
 def cmd_estimate_dates(_args) -> int:
