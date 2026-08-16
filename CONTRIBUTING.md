@@ -30,7 +30,7 @@ check to select) and `gh auth login` as the repo owner:
 ```bash
 gh api repos/pankajads/factfolio/branches/main/protection -X PUT \
   -H "Accept: application/vnd.github+json" \
-  -F 'required_status_checks[strict]=true' \
+  -F 'required_status_checks[strict]=false' \
   -f 'required_status_checks[contexts][]=test' \
   -F 'enforce_admins=true' \
   -F 'required_pull_request_reviews[required_approving_review_count]=0' \
@@ -44,10 +44,26 @@ change through a PR (the `required_pull_request_reviews` object being
 present at all is what blocks direct pushes — `null` would not), just
 without demanding an approval click nobody else is around to give.
 `enforce_admins=true` means even the owner can't bypass this by
-force-pushing. Equivalent UI path: **Settings → Branches → Add branch
-protection rule** → `main` → check **Require a pull request before
-merging** (0 approvals) + **Require status checks to pass** (select `test`)
-+ **Do not allow bypassing the above settings**.
+force-pushing.
+
+`strict=false` is also deliberate, and was learned the hard way (PR #2):
+`strict=true` ("require branches to be up to date before merging") sounds
+like the safer choice, but GitHub's auto-merge does **not** rebase/update a
+PR branch for you when it falls behind — it just waits indefinitely, even
+with every check green, until someone manually clicks "Update branch." On
+a low-traffic, largely-sequential repo like this one, that turns
+`auto-merge.yml` into "auto-merge, unless a previous PR happened to merge
+first," which defeats the point. `strict=false` means a PR merges as soon
+as its own CI passes, without needing to be re-verified against whatever
+merged most recently — an acceptable tradeoff here, and worth revisiting
+only if this repo ever gets enough concurrent PR traffic for that gap to
+matter.
+
+Equivalent UI path: **Settings → Branches → Add branch protection rule**
+→ `main` → check **Require a pull request before merging** (0 approvals)
++ **Require status checks to pass** (select `test`, leave "Require
+branches to be up to date" unchecked) + **Do not allow bypassing the
+above settings**.
 
 **2. Allow auto-merge at the repo level** (a prerequisite for
 `auto-merge.yml` to be able to call `gh pr merge --auto` at all):
