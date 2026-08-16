@@ -28,6 +28,11 @@ jobs:
       github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
+      # gh pr merge shells out to git internally (e.g. to resolve the repo),
+      # so it needs an actual checkout present even though this step never
+      # touches the working tree otherwise — without this it fails with
+      # "not a git repository" before ever reaching the GitHub API call.
+      - uses: actions/checkout@v4
       - env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh pr merge --auto --squash "${{ github.event.pull_request.number }}"
