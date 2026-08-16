@@ -7,6 +7,8 @@
 [![PyPI](https://img.shields.io/pypi/v/factfolio.svg)](https://pypi.org/project/factfolio/)
 [![CI](https://github.com/pankajads/factfolio/actions/workflows/ci.yml/badge.svg)](https://github.com/pankajads/factfolio/actions/workflows/ci.yml)
 
+**[→ pankajads.github.io/factfolio](https://pankajads.github.io/factfolio)** — the pitch, the agent pipeline, and what never leaves your machine, in one page.
+
 ### Every number, traced. No black box, no guesswork, no fees.
 
 Your broker app tells you what you own. Your advisor charges you to tell you
