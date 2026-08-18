@@ -10,6 +10,8 @@ from __future__ import annotations
 import argparse
 import sys
 from datetime import date
+from pathlib import Path
+from typing import Any
 
 import anyio
 from rich.console import Console
@@ -31,7 +33,154 @@ err_console = Console(stderr=True)
 
 _ACTION_STYLE = {"BUY": "green", "SELL": "red", "TRIM": "yellow", "HOLD": "cyan", "WATCH": "dim"}
 
-_POLICY_TEMPLATE = """\
+DIM, BOLD, RESET = "\033[2m", "\033[1m", "\033[0m"
+RED, YELLOW, GREEN = "\033[31m", "\033[33m", "\033[32m"
+
+# Risk-tier presets for the `factfolio init` policy interview — everything
+# in Policy that isn't a direct answer to one of its 4 questions (target
+# CAGR, horizon, monthly capital come straight from the answers; risk
+# appetite picks one of these bundles for the rest). Same defaults the
+# generic template already shipped are "moderate" here, so skipping the
+# interview and picking "moderate" land on the same numbers.
+_RISK_PRESETS: dict[str, dict[str, float | int]] = {
+    "conservative": dict(
+        core_min_pct=70.0, core_max_pct=80.0,
+        max_position_pct=6.0, max_satellite_position_pct=4.0, max_sector_pct=20.0,
+        speculative_cap_pct=5.0, min_positions=10, max_positions=20,
+        max_annual_turnover_pct=15.0,
+    ),
+    "moderate": dict(
+        core_min_pct=60.0, core_max_pct=70.0,
+        max_position_pct=8.0, max_satellite_position_pct=5.0, max_sector_pct=25.0,
+        speculative_cap_pct=10.0, min_positions=8, max_positions=25,
+        max_annual_turnover_pct=25.0,
+    ),
+    "aggressive": dict(
+        core_min_pct=40.0, core_max_pct=55.0,
+        max_position_pct=10.0, max_satellite_position_pct=7.0, max_sector_pct=30.0,
+        speculative_cap_pct=15.0, min_positions=6, max_positions=30,
+        max_annual_turnover_pct=35.0,
+    ),
+}
+
+
+def _ask(prompt: str, default: str) -> str:
+    """One interview question — Enter accepts the bracketed default."""
+    return input(f"{prompt} [{default}]: ").strip() or default
+
+
+def _ask_float(prompt: str, default: float) -> float:
+    raw = _ask(prompt, str(default))
+    try:
+        return float(raw)
+    except ValueError:
+        print(f"  {DIM}Not a number — using {default}.{RESET}")
+        return default
+
+
+def _ask_choice(prompt: str, choices: tuple[str, ...], default: str) -> str:
+    raw = _ask(f"{prompt} ({'/'.join(choices)})", default).strip().lower()
+    if raw not in choices:
+        print(f"  {DIM}Not one of {', '.join(choices)} — using {default}.{RESET}")
+        return default
+    return raw
+
+
+def _run_policy_interview() -> dict[str, Any] | None:
+    """Four questions to turn the starter policy into one that actually
+    reflects what you told it, instead of pure placeholders. Only ever
+    called for a brand-new policy file in an interactive terminal — see
+    cmd_init. Returns None on Ctrl-C/EOF, falling back to the generic
+    template rather than crashing init.
+    """
+    print(f"\n{BOLD}Let's set your investment policy{RESET} — 4 quick questions.")
+    print(f"{DIM}Press Enter to accept the default shown in [brackets]. You can "
+          f"always hand-edit memory/investment_policy.md later too.{RESET}\n")
+    try:
+        target_cagr = _ask_float(
+            "1. Target annual return (CAGR %)? Nifty's long-run average is ~12-13%.",
+            12.0,
+        )
+        risk = _ask_choice(
+            "2. Risk appetite —", ("conservative", "moderate", "aggressive"), "moderate"
+        )
+        horizon = _ask_float("3. Investment horizon, in years?", 10.0)
+        monthly_capital = _ask_float(
+            "4. New capital you can invest monthly, in ₹ (0 if none)?", 0.0
+        )
+    except (EOFError, KeyboardInterrupt):
+        print(f"\n{DIM}Skipped — using the generic starter instead.{RESET}")
+        return None
+
+    print()
+    return {
+        "target_cagr_pct": target_cagr,
+        "risk": risk,
+        "horizon_years": horizon,
+        "monthly_capital": monthly_capital,
+        **_RISK_PRESETS[risk],
+    }
+
+
+def _render_policy_template(answers: dict[str, Any] | None) -> str:
+    """The starter investment_policy.md — generic placeholders by default,
+    or filled in from a completed _run_policy_interview()."""
+    if answers is None:
+        objective = (
+            'State your target CAGR and horizon here, and why: e.g. "13% CAGR '
+            "over 10 years — roughly the Nifty's long-run average, prioritising "
+            'low drawdown over outperformance."'
+        )
+        structure = (
+            "Describe what belongs in each bucket for you (index funds/large-caps "
+            "vs. midcap/smallcap/thematic bets), and your current split."
+        )
+        limits_note = (
+            "Describe your position/sector/speculative caps and why — the numbers "
+            "below are generic starting points, not a recommendation."
+        )
+        yaml_comment = "# Generic starting values — replace every one of these with your own."
+        vals: dict[str, Any] = dict(
+            target_cagr_pct=12.0, core_min_pct=60.0, core_max_pct=70.0,
+            max_position_pct=8.0, max_satellite_position_pct=5.0, max_sector_pct=25.0,
+            speculative_cap_pct=10.0, min_positions=8, max_positions=25,
+            monthly_capital=0.0, max_annual_turnover_pct=25.0,
+        )
+        changelog = "Generated by `factfolio init`. Not yet customised or approved."
+    else:
+        risk = answers["risk"]
+        objective = (
+            f"{answers['target_cagr_pct']:.1f}% CAGR over {answers['horizon_years']:.0f} "
+            f"years, {risk} risk appetite — from the `factfolio init` interview. Edit "
+            "this prose to say *why*, not just what."
+        )
+        structure = (
+            f"{risk.capitalize()} preset: {answers['core_min_pct']:.0f}–"
+            f"{answers['core_max_pct']:.0f}% core (index funds/large-caps), the rest "
+            "satellite (midcap/smallcap/thematic bets). Describe your actual split "
+            "and what belongs in each bucket for you."
+        )
+        limits_note = (
+            f"{risk.capitalize()}-preset starting points from the interview — still "
+            "generic to your risk tier, not tailored to your specific holdings. "
+            "Describe why these are (or aren't) right for you."
+        )
+        yaml_comment = (
+            f"# From the `factfolio init` interview — {risk} risk preset. Still\n"
+            "# generic to the risk tier, not your specific holdings — review."
+        )
+        vals = {k: answers[k] for k in (
+            "target_cagr_pct", "core_min_pct", "core_max_pct", "max_position_pct",
+            "max_satellite_position_pct", "max_sector_pct", "speculative_cap_pct",
+            "min_positions", "max_positions", "max_annual_turnover_pct",
+        )}
+        vals["monthly_capital"] = answers["monthly_capital"]
+        changelog = (
+            f"Generated by `factfolio init` — {risk} risk, "
+            f"{answers['target_cagr_pct']:.1f}% CAGR target. Not yet approved."
+        )
+
+    return f"""\
 # Investment Policy
 
 **Status:** DRAFT — edit every number below before relying on this.
@@ -47,19 +196,15 @@ edit both together.
 
 ## Objective
 
-State your target CAGR and horizon here, and why: e.g. "13% CAGR over 10
-years — roughly the Nifty's long-run average, prioritising low drawdown
-over outperformance."
+{objective}
 
 ## Structure: core–satellite
 
-Describe what belongs in each bucket for you (index funds/large-caps vs.
-midcap/smallcap/thematic bets), and your current split.
+{structure}
 
 ## Position limits
 
-Describe your position/sector/speculative caps and why — the numbers below
-are generic starting points, not a recommendation.
+{limits_note}
 
 ## Rebalancing approach
 
@@ -70,31 +215,31 @@ when a sale is actually justified given its tax cost.
 
 ```yaml
 # ── Machine-enforceable limits. Parsed by portfolio/policy.py ──
-# Generic starting values — replace every one of these with your own.
-target_cagr_pct: 12.0
+{yaml_comment}
+target_cagr_pct: {vals['target_cagr_pct']:.1f}
 
-core_min_pct: 60.0
-core_max_pct: 70.0
+core_min_pct: {vals['core_min_pct']:.1f}
+core_max_pct: {vals['core_max_pct']:.1f}
 
 # Optional dated glidepath — delete this block entirely to use core_min_pct
 # as a flat target from day one instead of a phased-in one.
 # glidepath_start: YYYY-MM-DD
 # glidepath:
-#   - {months: 6,  core_pct: 30.0}
-#   - {months: 12, core_pct: 45.0}
+#   - {{months: 6,  core_pct: 30.0}}
+#   - {{months: 12, core_pct: 45.0}}
 
-max_position_pct: 8.0                 # any single core holding
-max_satellite_position_pct: 5.0       # any single satellite holding
-max_sector_pct: 25.0                  # any one sector
+max_position_pct: {vals['max_position_pct']:.1f}                 # any single core holding
+max_satellite_position_pct: {vals['max_satellite_position_pct']:.1f}       # any single satellite holding
+max_sector_pct: {vals['max_sector_pct']:.1f}                  # any one sector
 
-speculative_cap_pct: 10.0
+speculative_cap_pct: {vals['speculative_cap_pct']:.1f}
 speculative_symbols: []               # e.g. [IDEA, YESBANK] — binary-outcome names
 
-min_positions: 8
-max_positions: 25
+min_positions: {vals['min_positions']}
+max_positions: {vals['max_positions']}
 
-monthly_capital: 0                    # new capital available per month, in ₹
-max_annual_turnover_pct: 25.0
+monthly_capital: {vals['monthly_capital']:.0f}                    # new capital available per month, in ₹
+max_annual_turnover_pct: {vals['max_annual_turnover_pct']:.1f}
 ```
 
 ---
@@ -103,11 +248,8 @@ max_annual_turnover_pct: 25.0
 
 | Date | Change |
 |---|---|
-| __TODAY__ | Generated by `factfolio init`. Not yet customised or approved. |
+| {date.today().isoformat()} | {changelog} |
 """
-
-DIM, BOLD, RESET = "\033[2m", "\033[1m", "\033[0m"
-RED, YELLOW, GREEN = "\033[31m", "\033[33m", "\033[32m"
 
 SEVERITY_STYLE = {"critical": "red", "high": "red", "medium": "yellow", "low": "dim"}
 
@@ -297,32 +439,15 @@ def cmd_welcome(args) -> int:
     """No subcommand given — what someone who downloaded the standalone
     executable and double-clicked it actually experiences, as opposed to
     someone who already knows to type `factfolio status`. Runs first-time
-    setup if needed, shows an instant status snapshot if there's already a
-    portfolio to show one for, and always prints the numbered next step —
-    plain terminal output, identical on every platform, never a GUI. Since a
-    double-clicked console window on Windows closes itself the instant the
-    process exits, this also prints a command menu and waits for a keypress
-    afterward rather than vanishing before anyone can read it.
+    setup (see cmd_init) and prints exactly where it landed and what to do
+    next — plain terminal output, identical on every platform, never a GUI.
+    Since a double-clicked console window on Windows closes itself the
+    instant the process exits, this also waits for a keypress afterward
+    rather than vanishing before anyone can read it.
     """
-    from mybroker.config import HOLDINGS_EQUITY, HOLDINGS_INBOX_DIR, POLICY_FILE
-
     print(f"{BOLD}FactFolio{RESET}\n", flush=True)
 
-    first_run = not POLICY_FILE.exists()
     cmd_init(args)  # idempotent — safe whether this is a first run or not
-
-    holdings_ready = HOLDINGS_EQUITY.exists() or any(HOLDINGS_INBOX_DIR.glob("*"))
-    if holdings_ready and not first_run:
-        print()
-        cmd_status(args)
-
-    print(f"\n{BOLD}Other things you can run:{RESET}")
-    print(f"  factfolio status      {DIM}instant snapshot, no LLM{RESET}")
-    print(f"  factfolio report      {DIM}full multi-agent review{RESET}")
-    print(f"  factfolio chat        {DIM}terminal Q&A{RESET}")
-    print(f"  factfolio validate    {DIM}resolve tickers — do this before report/chat{RESET}")
-    print(f"  factfolio mcp         {DIM}run as an MCP server for other tools{RESET}")
-    print(f"  factfolio --help      {DIM}everything{RESET}")
 
     # Only pause for a frozen build in an actual interactive console — never
     # when piped/scripted (would hang forever waiting for input that never
@@ -333,48 +458,153 @@ def cmd_welcome(args) -> int:
     return 0
 
 
-def cmd_init(_args) -> int:
-    """First-run setup: create the runtime dirs and a starter policy file.
+def _looks_initialized(path: Path) -> bool:
+    """True if `path` is itself an existing factfolio project root."""
+    return (path / "memory" / "investment_policy.md").exists()
 
-    Never overwrites an existing memory/investment_policy.md — safe to
+
+def _next_available(cwd: Path) -> Path:
+    """The first unused `factfolio-2`, `factfolio-3`, … under `cwd`."""
+    n = 2
+    while (cwd / f"factfolio-{n}").exists():
+        n += 1
+    return cwd / f"factfolio-{n}"
+
+
+def _resolve_init_target(cwd: Path) -> Path:
+    """Decide which directory this run of `factfolio init` should set up.
+
+    - Already standing inside an initialized project (this dir has its own
+      memory/investment_policy.md) → use it as-is. Re-running init from
+      inside your own project must stay a safe no-op refresh, not another
+      layer of nesting.
+    - Otherwise, create a fresh `factfolio/` folder under here — like `git
+      clone` or `create-react-app`, init hands you a folder to `cd` into
+      rather than scattering runtime dirs into whatever directory you
+      happened to be standing in when you ran it.
+    - If `factfolio/` already exists here and is itself an initialized
+      project → reuse it (same safe-rerun guarantee).
+    - If it exists but isn't one — some unrelated folder that happens to be
+      named `factfolio` — ask before touching it instead of assuming.
+    - If it exists and isn't even a directory (a stray file from an old
+      download, say) there's no in-place option that doesn't mean deleting
+      someone's file, so always make way instead of asking.
+    """
+    if _looks_initialized(cwd):
+        return cwd
+
+    candidate = cwd / "factfolio"
+    if not candidate.exists():
+        return candidate
+    if candidate.is_dir() and _looks_initialized(candidate):
+        return candidate
+
+    if not candidate.is_dir():
+        print(f"{DIM}'{candidate}' already exists and isn't a folder — "
+              f"creating a new copy instead of touching it.{RESET}")
+        return _next_available(cwd)
+
+    if sys.stdin.isatty():
+        print(f"{YELLOW}A folder named 'factfolio' already exists here, but it "
+              f"isn't a factfolio project.{RESET}")
+        answer = input(
+            "  [o]verwrite — set up factfolio inside it as-is, or "
+            "create a new [c]opy? [o/C] "
+        ).strip().lower()
+    else:
+        answer = "c"
+        print(f"{DIM}'{candidate}' already exists and isn't a factfolio project — "
+              f"non-interactive run, so creating a new copy rather than touching it.{RESET}")
+
+    if answer.startswith("o"):
+        return candidate
+
+    return _next_available(cwd)
+
+
+def cmd_init(_args) -> int:
+    """First-run setup: create a dedicated project folder (runtime dirs + a
+    starter investment_policy.md) and print exactly how to use it.
+
+    Idempotent: re-running from inside an already-initialized folder, or
+    from the folder that contains one, never overwrites an existing
+    memory/investment_policy.md and never nests a second copy — safe to
     re-run any time (e.g. after adding a new symbol to tickers.yaml).
     """
-    from mybroker.config import (
-        HOLDINGS_EQUITY,
-        HOLDINGS_INBOX_DIR,
-        POLICY_FILE,
-        SRC_DIR,
-    )
+    from mybroker import config
 
-    ensure_dirs()
+    target = _resolve_init_target(Path.cwd())
+    config.set_project_root(target)
+    config.ensure_dirs()
 
-    if POLICY_FILE.exists():
-        print(f"{DIM}✓ {POLICY_FILE} already exists — left untouched.{RESET}")
+    if config.POLICY_FILE.exists():
+        print(f"{DIM}✓ {config.POLICY_FILE} already exists — left untouched.{RESET}")
     else:
-        POLICY_FILE.write_text(
-            _POLICY_TEMPLATE.replace("__TODAY__", date.today().isoformat()),
-            encoding="utf-8",
-        )
-        print(f"{GREEN}✓{RESET} Wrote a starter {POLICY_FILE}")
-        print(f"  {DIM}Edit every number in it before relying on any recommendation.{RESET}")
+        answers = _run_policy_interview() if sys.stdin.isatty() else None
+        config.POLICY_FILE.write_text(_render_policy_template(answers), encoding="utf-8")
+        print(f"{GREEN}✓{RESET} Set up {target}")
+        print(f"  {DIM}wrote memory/investment_policy.md"
+              f"{' from your answers above' if answers else ''}{RESET}")
 
-    print(f"\n{BOLD}Next steps{RESET}")
-    steps = []
-    if not HOLDINGS_EQUITY.exists() and not any(HOLDINGS_INBOX_DIR.glob("*")):
-        steps.append(
-            f"Add your holdings: export from your broker and place it at "
-            f"{HOLDINGS_EQUITY}, or drop any csv/xls/xlsx/pdf/txt export into "
-            f"{HOLDINGS_INBOX_DIR}/."
+    if config.TICKERS_FILE.exists():
+        print(f"{DIM}✓ {config.TICKERS_FILE} already exists — left untouched.{RESET}")
+    else:
+        # Seeded, not read in place from SRC_DIR — a PyInstaller onefile
+        # build's SRC_DIR is a temp folder wiped on exit, so that path is
+        # never somewhere anyone could durably edit. This copy is yours.
+        config.TICKERS_FILE.write_text(
+            config.DEFAULT_TICKERS_FILE.read_text(encoding="utf-8"), encoding="utf-8"
         )
-    steps.append(
-        f"Add every symbol you hold to {SRC_DIR / 'data' / 'tickers.yaml'} "
-        f"(see that file's own header for the format)."
-    )
-    steps.append("Run `factfolio validate` to resolve every ticker.")
-    steps.append("Run `factfolio status` for an instant, LLM-free snapshot.")
-    for i, step in enumerate(steps, 1):
-        print(f"  {i}. {step}")
+        print(f"{GREEN}✓{RESET} Seeded {config.TICKERS_FILE} from the bundled defaults")
+
+    _print_getting_started(target, config.TICKERS_FILE)
     return 0
+
+
+def _print_getting_started(target: Path, tickers_file: Path) -> None:
+    """Printed once init is done — where things live, what's required
+    before the first real command, and what's optional. Not a "next steps"
+    checklist someone has to re-derive from four different docs."""
+    print(f"\n{BOLD}Project:{RESET} {target}")
+
+    print(f"\n{BOLD}1. Go there{RESET}")
+    print(f"     cd {target}")
+
+    print(f"\n{BOLD}2. Add your holdings{RESET} — either:")
+    print(f"     • {target / 'holdings.csv'} (+ optional holdings_mf.csv) "
+          f"— standard Zerodha export")
+    print(f"     • or drop any broker export into {target / 'holdings_inbox'}/ "
+          f"— csv, xls, xlsx, pdf, or txt,")
+    print("       equity or mutual fund, any filename — each file is sniffed "
+          "and classified automatically")
+
+    print(f"\n{BOLD}3. Map every symbol you hold{RESET} in {tickers_file}")
+    print("     an unmapped symbol is a hard error on purpose — no silent .NS guessing")
+
+    print(f"\n{BOLD}4. Set your real numbers{RESET} in "
+          f"{target / 'memory' / 'investment_policy.md'}")
+    print("     target CAGR, core/satellite split, position/sector caps — every "
+          "recommendation")
+    print("     is checked against these, never against whatever the LLM feels like saying")
+    print("     it's plain text — as your goals, risk appetite, or target return "
+          "change, just edit")
+    print("     it again; nothing about it is fixed at init time")
+
+    print(f"\n{BOLD}Then, from inside {target.name}/:{RESET}")
+    print(f"  factfolio validate    {DIM}resolve every ticker — run this before report/chat{RESET}")
+    print(f"  factfolio status      {DIM}instant snapshot — deterministic, no LLM{RESET}")
+    print(f"  factfolio report      {DIM}full multi-agent review → reports/{RESET}")
+    print(f"  factfolio chat        {DIM}terminal Q&A, one agent{RESET}")
+    print(f"  factfolio mcp         {DIM}run as an MCP server for other tools{RESET}")
+    print(f"  factfolio --help      {DIM}everything{RESET}")
+
+    print(f"\n{BOLD}The LLM, in short:{RESET} only `report`, `chat`, and mcp's "
+          f"run_portfolio_review call one —")
+    print("  your local `claude login` session by default, or export "
+          "ANTHROPIC_API_KEY to override.")
+    print("  status/validate/cron/estimate-dates are pure deterministic Python, "
+          "no LLM involved.")
+    print("  Either way, your holdings and their values never leave this machine.")
 
 
 def cmd_validate(_args) -> int:
