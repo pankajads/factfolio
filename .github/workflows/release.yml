@@ -88,7 +88,7 @@ jobs:
           ./dist/factfolio --version
           cd "$RUNNER_TEMP" && mkdir -p smoketest && cd smoketest
           "$GITHUB_WORKSPACE/dist/factfolio" init
-          test -d memory
+          test -d factfolio/memory
       - name: Smoke test (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -98,7 +98,7 @@ jobs:
           New-Item -ItemType Directory -Path "$env:RUNNER_TEMP\smoketest" | Out-Null
           Set-Location "$env:RUNNER_TEMP\smoketest"
           & "$env:GITHUB_WORKSPACE\dist\factfolio.exe" init
-          if (-not (Test-Path memory)) { exit 1 }
+          if (-not (Test-Path factfolio\memory)) { exit 1 }
 
       - name: Rename artifact
         shell: bash

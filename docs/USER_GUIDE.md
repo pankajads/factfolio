@@ -22,19 +22,38 @@ cd factfolio
 uv venv --python 3.12
 uv sync --extra dev
 uv run factfolio init
+cd factfolio
 ```
 
-`factfolio init` does three things, safe to re-run any time:
+`factfolio init` does four things, safe to re-run any time:
 
-1. Creates the runtime folders (`memory/`, `reports/`, `logs/`,
-   `holdings_inbox/`, `.cache/`) if they don't exist.
+1. Creates a dedicated `factfolio/` project folder under wherever you ran
+   it (yes, this means `factfolio/factfolio/` right after a fresh clone —
+   the outer one is the code, the inner one is *your* data: `memory/`,
+   `reports/`, `logs/`, `holdings_inbox/`, `.cache/`). Re-running `init`
+   from inside that folder refreshes it in place rather than nesting
+   another copy; if a folder named `factfolio` already exists somewhere but
+   isn't one of its own projects, it asks before touching it (or, run
+   non-interactively, creates `factfolio-2` instead of guessing).
 2. Writes a **starter `memory/investment_policy.md`** if you don't already
-   have one — generic placeholder numbers, clearly marked DRAFT. It will
-   never overwrite a policy file you've already customised.
-3. Prints a checklist of what's still missing before the tool is useful for
-   *your* portfolio.
+   have one, clearly marked DRAFT. In an interactive terminal, it first
+   asks 4 quick questions — target CAGR, risk appetite (conservative/
+   moderate/aggressive), horizon in years, monthly investable capital —
+   and fills the file in from your answers instead of generic placeholders
+   (risk appetite also picks sensible starting position/sector caps for
+   the rest). Piped/scripted/CI runs skip the questions and get the plain
+   generic template. Either way, it's plain text — as your goals, risk
+   appetite, or target return change, just edit it again; nothing here is
+   fixed at init time, and an existing policy file is never overwritten or
+   re-prompted for.
+3. Seeds your own `tickers.yaml` at the project root, copied from the
+   bundled defaults — yours to add symbols to from then on (see
+   [§3](#3-add-your-holdings)). Never overwritten on a re-run either.
+4. Prints exactly where it landed and what to do next.
 
-That checklist is really the rest of this section:
+Every command below this point — and the rest of this guide — assumes
+you've `cd`ed into that `factfolio/` project folder. That checklist is
+really the rest of this section:
 
 ## 3. Add your holdings
 
@@ -59,10 +78,13 @@ Both sources merge automatically — you can have `holdings.csv` at the root
 *and* other files in `holdings_inbox/` at the same time; there's no need to
 consolidate everything into one file.
 
-**Every holding needs a ticker mapping.** Open
-`src/mybroker/data/tickers.yaml` and add an entry for each symbol you hold
-that isn't already there (the file ships with the maintainer's own
-portfolio's symbols as examples — yours will be different):
+**Every holding needs a ticker mapping.** `factfolio init` seeded your own
+`tickers.yaml` at the project root, copied from the bundled defaults —
+open it and add an entry for each symbol you hold that isn't already there
+(it ships with the maintainer's own portfolio's symbols as examples —
+yours will be different). It's yours from that point on: edits persist
+across runs and upgrades, on every install method including the standalone
+executable, unlike editing the package's own bundled copy directly.
 
 ```yaml
 symbols:

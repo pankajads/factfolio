@@ -25,7 +25,7 @@ from datetime import UTC, datetime
 
 import yfinance as yf
 
-from mybroker.config import RESOLVED_TICKERS, ensure_dirs, load_tickers
+from mybroker.config import RESOLVED_TICKERS, TICKERS_FILE, ensure_dirs, load_tickers
 
 GREEN, RED, YELLOW, DIM, RESET = "\033[32m", "\033[31m", "\033[33m", "\033[2m", "\033[0m"
 OK, FAIL, WARN = f"{GREEN}✓{RESET}", f"{RED}✗{RESET}", f"{YELLOW}!{RESET}"
@@ -142,7 +142,7 @@ def main() -> int:
 
     if failures:
         print(f"\n{FAIL} UNRESOLVED: {', '.join(failures)}")
-        print(f"  {DIM}Add working candidates to src/mybroker/data/tickers.yaml{RESET}\n")
+        print(f"  {DIM}Add working candidates to {TICKERS_FILE}{RESET}\n")
         return 1
 
     print(f"\n{OK} All tickers resolved.\n")

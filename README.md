@@ -22,7 +22,8 @@ It never sends your holdings anywhere. It never predicts the future. And it
 never asks you to trust a number it can't show you the receipt for.
 
 ```bash
-uvx factfolio init
+uvx factfolio init               # creates ./factfolio/, prints how to use it
+cd factfolio
 uvx factfolio report             # → reports/, a full multi-agent portfolio review
 ```
 
@@ -85,8 +86,17 @@ Three ways to get it, in order of how much you want on your machine:
 uvx factfolio init          # runs it straight from PyPI, nothing installed persistently
 # or: pip install factfolio && factfolio init
 ```
-Reads and writes wherever you run it from — `cd` into a folder for this
-portfolio first, the same way you'd use `git` or `terraform`.
+`init` creates a `factfolio/` project folder under wherever you ran it —
+memory, holdings, reports, your own `tickers.yaml`, everything for *this*
+portfolio lives there — and prints the exact `cd` command plus what to do
+next. In an interactive terminal it also asks 4 quick questions (target
+CAGR, risk appetite, horizon, monthly capital) to seed a real starter
+`investment_policy.md` instead of pure placeholders — plain text either
+way, so edit it again anytime your numbers change. Run every other command
+from inside the folder it creates. Re-running `init` is always safe: from
+inside an existing project it just refreshes in place, and it never
+overwrites an unrelated folder that happens to already be named
+`factfolio` (it asks first, or creates `factfolio-2` non-interactively).
 
 **2. Standalone executable — no Python at all.** Download `factfolio` (or
 `factfolio.exe` on Windows) for your OS from the
@@ -122,13 +132,15 @@ Still needs the `claude` CLI separately for `report`/`chat` — see
 ```bash
 uv venv --python 3.12
 uv sync --extra dev
-uv run factfolio init      # creates memory/, a starter policy file, prints next steps
+uv run factfolio init      # creates factfolio/ inside the checkout — your data, not the code
+cd factfolio
 ```
 > **Note:** always use `uv run …` here. The `python3` on your PATH is a
 > different interpreter without these dependencies. The CLI command is
 > `factfolio` (the underlying Python package is `mybroker` for historical
 > reasons — both `uv run factfolio ...` and `uv run mybroker ...` run the
-> identical CLI).
+> identical CLI). `uv run` still works after the `cd` — it resolves the
+> checkout via its own project markers, not the current directory.
 
 Whichever you pick, the day-to-day commands below are identical — swap
 `uv run factfolio` for `uvx factfolio`, `factfolio` (pip-installed), or
