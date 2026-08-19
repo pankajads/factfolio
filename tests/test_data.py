@@ -85,17 +85,34 @@ class TestTickerResolution:
         assert ".NS" in str(exc.value)
 
     @pytest.mark.parametrize("symbol", ["SAMPLERENAME", "SAMPLESPLIT-A", "SAMPLESPLIT-B"])
-    def test_renamed_and_demerged_symbols_resolve(self, symbol):
+    def test_renamed_and_demerged_symbols_resolve(self, symbol, monkeypatch):
         """The bundled tickers.yaml's own rename/demerger examples — these
         are exactly the shape of symbol a naive .NS guess gets wrong.
-        Real-world regression: this test previously hardcoded the
-        maintainer's actual portfolio symbols (ETERNAL/HEXT/TMCV/TMPV),
-        which only ever worked locally by masking through a stale
-        .cache/resolved_tickers.json — it silently broke in CI the moment
-        the bundled file's example data changed. Pointing this at the
-        bundled file's own illustrative entries instead means it can never
-        depend on anyone's personal tickers.yaml again."""
-        assert YFinanceProvider().resolve(symbol).endswith((".NS", ".BO"))
+
+        Real-world regression, twice over: this test previously hardcoded
+        the maintainer's actual portfolio symbols (ETERNAL/HEXT/TMCV/TMPV),
+        which only ever passed locally by masking through a stale
+        .cache/resolved_tickers.json — it broke silently in CI the moment
+        the bundled file's example data changed. Pointing it at the
+        bundled file's own illustrative entries fixed CI, but then failed
+        on the maintainer's own machine instead, because a project-local
+        tickers.yaml (personal, real symbols) legitimately takes priority
+        over the bundled one — see config.load_tickers(). Forcing
+        TICKERS_FILE somewhere that can't exist, and clearing
+        load_tickers's cache, makes this test exercise the bundled file
+        specifically, regardless of whatever tickers.yaml (or lack of one)
+        happens to be sitting in whoever's project root.
+        """
+        from mybroker import config
+
+        monkeypatch.setattr(config, "TICKERS_FILE", config.PROJECT_ROOT / "__no_such_file__.yaml")
+        config.load_tickers.cache_clear()
+        try:
+            assert YFinanceProvider().resolve(symbol).endswith((".NS", ".BO"))
+        finally:
+            # Don't leak this test's bundled-only view into whatever test
+            # runs next — the cache isn't tied to monkeypatch's own undo.
+            config.load_tickers.cache_clear()
 
 
 class TestProvenance:
