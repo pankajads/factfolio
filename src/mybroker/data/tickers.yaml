@@ -1,0 +1,109 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Zerodha symbol  →  yfinance ticker map
+#
+# WHY THIS FILE EXISTS
+#   Zerodha's trading symbol is NOT always the yfinance ticker. Renames,
+#   relistings and demergers break the naive `f"{symbol}.NS"` assumption, and
+#   they break it *silently* — yfinance returns an empty frame, not an error.
+#
+#   `candidates` is an ordered list. The validator tries each in turn and uses
+#   the first that returns a usable price series. This makes resolution
+#   empirical rather than a guess baked into code.
+#
+# FIELDS
+#   name           human-readable company name
+#   candidates     ordered yfinance tickers to try (first working one wins)
+#   sector         used for concentration limits
+#   tier           large | mid | small  — drives core/satellite classification
+#   bucket         core | satellite     — explicit policy classification
+#   notes          anything that makes this symbol unusual
+#
+# These are illustrative placeholder entries, not a real portfolio — `factfolio
+# init` seeds this file, then scans your own holdings.csv/holdings_inbox/ and
+# drafts real entries for what you actually hold (some fully automatically,
+# some via an AI-assisted resolver — see docs/USER_GUIDE.md §3). Replace or
+# delete everything below before relying on it.
+# ─────────────────────────────────────────────────────────────────────────────
+
+symbols:
+  SAMPLECORE:
+    name: Sample Core Holding Ltd
+    candidates: [SAMPLECORE.NS, SAMPLECORE.BO]
+    sector: Banking
+    tier: large
+    bucket: core
+    notes: A plain, unremarkable entry — most of yours will look like this.
+
+  SAMPLERENAME:
+    name: Sample Renamed Ltd (formerly OldName)
+    candidates: [SAMPLERENAME.NS, OLDNAME.NS, SAMPLERENAME.BO]
+    sector: Consumer Tech
+    tier: large
+    bucket: satellite
+    notes: >
+      Illustrates a rename: pre-rename price history may only exist under the
+      old ticker, so both are listed as candidates — the two series may need
+      stitching for long-window analysis.
+
+  SAMPLESPLIT-A:
+    name: Sample Demerger Entity A
+    candidates: [SAMPLESPLIT-A.NS, SAMPLESPLIT-A.BO]
+    sector: Automobile
+    tier: large
+    bucket: satellite
+    notes: >
+      DEMERGER ENTITY — illustrates a corporate-action split. Very short
+      standalone history right after a demerger; the validator resolves the
+      real ticker empirically rather than guessing.
+
+  SAMPLESPLIT-B:
+    name: Sample Demerger Entity B
+    candidates: [SAMPLESPLIT-B.NS, SAMPLESPLIT-B.BO]
+    sector: Automobile
+    tier: large
+    bucket: satellite
+    notes: >
+      Sibling of SAMPLESPLIT-A from the same demerger — economically linked,
+      and should land in the same correlation community. If they don't, the
+      price input is wrong.
+
+  SAMPLESPEC:
+    name: Sample Speculative Holding Ltd
+    candidates: [SAMPLESPEC.NS, SAMPLESPEC.BO]
+    sector: Telecom
+    tier: mid
+    bucket: satellite
+    notes: >
+      Illustrates a speculative/binary-outcome position — heavily indebted or
+      otherwise high-risk. Sized deliberately small; see speculative_cap_pct
+      in your own investment_policy.md.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Benchmark and sector indices (for regime detection and beta)
+# ─────────────────────────────────────────────────────────────────────────────
+indices:
+  NIFTY50:      { name: Nifty 50,          candidates: ["^NSEI"] }
+  SENSEX:       { name: BSE Sensex,        candidates: ["^BSESN"] }
+  NIFTYMIDCAP:  { name: Nifty Midcap 50,   candidates: ["^NSEMDCP50"] }
+  NIFTY500:     { name: Nifty 500,         candidates: ["^CRSLDX"] }
+  NIFTYNEXT50:  { name: Nifty Next 50,     candidates: ["^NSMIDCP"] }
+  INDIAVIX:     { name: India VIX,         candidates: ["^INDIAVIX"] }
+  NIFTYBANK:    { name: Nifty Bank,        candidates: ["^NSEBANK"] }
+  # Yahoo does not serve Nifty Smallcap 100 as an index (^CNXSC returns a
+  # 1-day stub). This is an ETF standing in as a PROXY — it tracks a momentum-
+  # quality subset, not the broad smallcap index, so treat readings as
+  # directional only. Labelled honestly rather than passed off as the index.
+  SMALLCAP_PROXY:
+    name: Nifty Smallcap (ETF proxy — NOT the index)
+    candidates: ["SMALLCAP.NS"]
+    is_proxy: true
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Analysis thresholds
+# ─────────────────────────────────────────────────────────────────────────────
+settings:
+  # A series shorter than this many trading days is flagged INSUFFICIENT_HISTORY
+  # and excluded from correlation maths rather than silently corrupting it.
+  min_history_days: 60
+  # Preferred window for correlation / MST construction
+  correlation_window_days: 250

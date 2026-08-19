@@ -9,6 +9,12 @@ assets.yaml
 memory/
 reports/
 logs/
+# A root-level tickers.yaml is a *personal* symbol map (which stocks you
+# hold, sector/strategy notes) — same sensitivity class as holdings.csv.
+# The package's own bundled src/mybroker/data/tickers.yaml stays generic/
+# illustrative and IS committed; this root-level one is your own project
+# copy (created by `factfolio init`, or a local dev copy for testing).
+/tickers.yaml
 *.db
 *.sqlite
 *.sqlite3
