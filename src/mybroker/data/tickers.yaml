@@ -18,65 +18,18 @@
 #   bucket         core | satellite     — explicit policy classification
 #   notes          anything that makes this symbol unusual
 #
-# These are illustrative placeholder entries, not a real portfolio — `factfolio
-# init` seeds this file, then scans your own holdings.csv/holdings_inbox/ and
-# drafts real entries for what you actually hold (some fully automatically,
-# some via an AI-assisted resolver — see docs/USER_GUIDE.md §3). Replace or
-# delete everything below before relying on it.
+# This is a scaffold, not a real (or even a fake-but-working) portfolio —
+# it used to ship illustrative SAMPLE* placeholder entries here, but those
+# were never real yfinance tickers, so `factfolio validate` run before your
+# holdings existed just probed Yahoo for nonsense and printed a wall of 404s
+# that read like a bug. `factfolio init` (and `validate`, self-healing on
+# every run) scans your own holdings.csv/holdings_inbox/ and drafts real
+# entries for what you actually hold instead — some fully automatically,
+# some via an AI-assisted resolver, see docs/USER_GUIDE.md §3. Add entries
+# here yourself for anything that isn't auto-drafted.
 # ─────────────────────────────────────────────────────────────────────────────
 
-symbols:
-  SAMPLECORE:
-    name: Sample Core Holding Ltd
-    candidates: [SAMPLECORE.NS, SAMPLECORE.BO]
-    sector: Banking
-    tier: large
-    bucket: core
-    notes: A plain, unremarkable entry — most of yours will look like this.
-
-  SAMPLERENAME:
-    name: Sample Renamed Ltd (formerly OldName)
-    candidates: [SAMPLERENAME.NS, OLDNAME.NS, SAMPLERENAME.BO]
-    sector: Consumer Tech
-    tier: large
-    bucket: satellite
-    notes: >
-      Illustrates a rename: pre-rename price history may only exist under the
-      old ticker, so both are listed as candidates — the two series may need
-      stitching for long-window analysis.
-
-  SAMPLESPLIT-A:
-    name: Sample Demerger Entity A
-    candidates: [SAMPLESPLIT-A.NS, SAMPLESPLIT-A.BO]
-    sector: Automobile
-    tier: large
-    bucket: satellite
-    notes: >
-      DEMERGER ENTITY — illustrates a corporate-action split. Very short
-      standalone history right after a demerger; the validator resolves the
-      real ticker empirically rather than guessing.
-
-  SAMPLESPLIT-B:
-    name: Sample Demerger Entity B
-    candidates: [SAMPLESPLIT-B.NS, SAMPLESPLIT-B.BO]
-    sector: Automobile
-    tier: large
-    bucket: satellite
-    notes: >
-      Sibling of SAMPLESPLIT-A from the same demerger — economically linked,
-      and should land in the same correlation community. If they don't, the
-      price input is wrong.
-
-  SAMPLESPEC:
-    name: Sample Speculative Holding Ltd
-    candidates: [SAMPLESPEC.NS, SAMPLESPEC.BO]
-    sector: Telecom
-    tier: mid
-    bucket: satellite
-    notes: >
-      Illustrates a speculative/binary-outcome position — heavily indebted or
-      otherwise high-risk. Sized deliberately small; see speculative_cap_pct
-      in your own investment_policy.md.
+symbols: {}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Benchmark and sector indices (for regime detection and beta)

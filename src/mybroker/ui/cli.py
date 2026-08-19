@@ -8,7 +8,6 @@ them plain terminal I/O or structured data, no GUI.
 from __future__ import annotations
 
 import argparse
-import re
 import sys
 from datetime import date
 from pathlib import Path
@@ -20,9 +19,25 @@ from rich.console import Console
 from rich.table import Table
 
 from mybroker.config import REPORTS_DIR, ensure_dirs
+
+# Drafting logic itself (pure Python, no network/LLM) lives in
+# portfolio/ticker_seeding.py — shared with `factfolio validate`, which
+# self-heals a missing/incomplete tickers.yaml the same way rather than
+# falling back to probing the bundled illustrative defaults. Aliased back
+# to their old private names here since this module's the one place that
+# also drives the AI-assisted resolver around them (_suggest_ticker_matches
+# below) — which also uses is_pristine_draft/backfill_draft_entry directly
+# (via the `ticker_seeding` module import), so an existing entry the agent
+# is confident about but that's still an untouched draft gets its name/
+# sector backfilled instead of just printed as a "?" for a human to redo.
+from mybroker.portfolio import ticker_seeding
 from mybroker.portfolio.loader import load_portfolio
 from mybroker.portfolio.metrics import snapshot
 from mybroker.portfolio.policy import Policy
+from mybroker.portfolio.ticker_seeding import insert_ticker_yaml_block as _insert_ticker_yaml_block
+from mybroker.portfolio.ticker_seeding import (
+    seed_draft_ticker_entries as _seed_draft_ticker_entries,
+)
 
 # stdout: the actual thing someone ran a command to see (tables, reports).
 # stderr: chrome around that -- auth status, progress, "next steps" menus.
@@ -465,6 +480,23 @@ def _looks_initialized(path: Path) -> bool:
     return (path / "memory" / "investment_policy.md").exists()
 
 
+def _standing_beside_own_project() -> bool:
+    """True for exactly the mistake config.cd_hint_if_project_nearby()
+    already describes: `factfolio init` was run from directory X, creating
+    `X/factfolio/`, and a later command runs from X itself — forgetting
+    the `cd` — rather than the folder init actually printed.
+
+    Every command except `init`/bare `factfolio` (which redirect
+    themselves into that nested folder on purpose, see
+    _resolve_init_target) must catch this BEFORE doing any work: the old
+    behaviour was to silently scaffold a second, empty logs/reports/
+    memory/holdings_inbox layout right beside the real project — every
+    file dropped in a *previous* run's holdings_inbox/, every entry in its
+    tickers.yaml, invisible from here.
+    """
+    return not _looks_initialized(Path.cwd()) and _looks_initialized(Path.cwd() / "factfolio")
+
+
 def _next_available(cwd: Path) -> Path:
     """The first unused `factfolio-2`, `factfolio-3`, … under `cwd`."""
     n = 2
@@ -502,8 +534,16 @@ def _resolve_init_target(cwd: Path) -> Path:
         return candidate
 
     if not candidate.is_dir():
-        print(f"{DIM}'{candidate}' already exists and isn't a folder — "
-              f"creating a new copy instead of touching it.{RESET}")
+        # Loud on purpose — this decides WHERE your project lives, and
+        # printing it dim as the very first line (before the policy
+        # interview even starts) meant it was trivial to scroll past and
+        # only notice a `factfolio-2` folder afterwards with no idea why.
+        print(f"\n{YELLOW}! '{candidate}' already exists and isn't a "
+              f"folder{RESET} {DIM}(a file with that exact name — maybe "
+              f"the factfolio executable itself, if you copied it "
+              f"here){RESET}")
+        print(f"  {DIM}Not touching it — setting up the project one folder "
+              f"over instead.{RESET}")
         return _next_available(cwd)
 
     if sys.stdin.isatty():
@@ -524,94 +564,6 @@ def _resolve_init_target(cwd: Path) -> Path:
     return _next_available(cwd)
 
 
-def _draft_ticker_entry(symbol: str) -> str:
-    """One new tickers.yaml entry, clearly marked as unverified — see
-    _seed_draft_ticker_entries. `candidates` is a guess `factfolio
-    validate` will empirically confirm or reject, never silently trusted;
-    sector/tier/bucket stay honestly unclassified (`Unknown`/`unknown`)
-    rather than guessed, since nothing in a holdings file says what sector
-    a stock is in."""
-    return (
-        f"  {symbol}:\n"
-        f"    name: {symbol}  # TODO: replace with the real company name\n"
-        f"    candidates: [{symbol}.NS, {symbol}.BO]  # DRAFT — unverified guess\n"
-        f"    sector: Unknown  # TODO\n"
-        f"    tier: unknown  # TODO: large | mid | small\n"
-        f"    bucket: satellite  # TODO: core | satellite\n"
-        f"    notes: >\n"
-        f"      DRAFT — seeded from your holdings at `factfolio init`. Verify the\n"
-        f"      candidates resolve (`factfolio validate`) and fill in\n"
-        f"      sector/tier/bucket before relying on this.\n"
-    )
-
-
-def _insert_ticker_yaml_block(tickers_file: Path, entries_text: str) -> bool:
-    """Insert `entries_text` (one or more already-formatted entries) into
-    the `symbols:` section of `tickers_file`, right after the last real
-    entry and before any blank/comment lines already leading into the
-    next top-level key (`indices:`/`settings:` in the bundled file, EOF
-    otherwise) — never between them. Returns False (and touches nothing)
-    if there's no `symbols:` key to anchor on at all, e.g. a hand-edited
-    file that's drifted too far from the template to guess an insertion
-    point in safely.
-    """
-    text = tickers_file.read_text(encoding="utf-8")
-    lines = text.splitlines(keepends=True)
-    try:
-        symbols_idx = next(i for i, line in enumerate(lines) if line.startswith("symbols:"))
-    except StopIteration:
-        return False
-
-    end = len(lines)
-    for i in range(symbols_idx + 1, len(lines)):
-        if re.match(r"^[A-Za-z_]", lines[i]):
-            end = i
-            break
-    insert_at = end
-    while insert_at > symbols_idx + 1 and (
-        lines[insert_at - 1].strip() == "" or lines[insert_at - 1].lstrip().startswith("#")
-    ):
-        insert_at -= 1
-
-    lines[insert_at:insert_at] = ["\n" + entries_text]
-    tickers_file.write_text("".join(lines), encoding="utf-8")
-    return True
-
-
-def _seed_draft_ticker_entries(tickers_file: Path) -> set[str]:
-    """Append a DRAFT entry for every symbol found in your holdings that
-    isn't mapped in `tickers_file` yet — genuine short-symbol sources only
-    (Zerodha's `Instrument`, a generic `Symbol` column); a source with
-    only a full company name (a demat holdings PDF, say) has no reliable
-    symbol to derive, so those stay on the existing "not in tickers.yaml"
-    warning path instead of being guessed at here.
-
-    Never touches an existing entry, and re-running this is exactly how
-    new holdings get picked up over time — safe to call on every `init`,
-    not just the first. Returns the symbols actually added.
-    """
-    from mybroker.config import HOLDINGS_EQUITY, HOLDINGS_INBOX_DIR
-    from mybroker.portfolio.importers import (
-        discover_equity_symbols_for_drafting,
-        discover_inbox_files,
-    )
-
-    existing = set((yaml.safe_load(tickers_file.read_text()) or {}).get("symbols") or {})
-
-    found: set[str] = set()
-    if HOLDINGS_EQUITY.exists():
-        found |= discover_equity_symbols_for_drafting(HOLDINGS_EQUITY)
-    for file in discover_inbox_files(HOLDINGS_INBOX_DIR):
-        found |= discover_equity_symbols_for_drafting(file)
-
-    new_symbols = sorted(found - existing)
-    if not new_symbols:
-        return set()
-
-    block = "".join(_draft_ticker_entry(s) for s in new_symbols)
-    if not _insert_ticker_yaml_block(tickers_file, block):
-        return set()
-    return set(new_symbols)
 
 
 def cmd_init(_args) -> int:
@@ -715,7 +667,21 @@ def _suggest_ticker_matches() -> None:
 
     try:
         _resolve_via_agent(todo, skipped)
-    except Exception:
+    except Exception as exc:
+        # Deliberately never a gate that could block `init` — but silently
+        # swallowing the *reason* meant a real cause (no `claude login`, a
+        # network blip, a malformed response) was unrecoverable after the
+        # fact: the holdings just never got mapped, with nothing anywhere
+        # saying why. Logged, not printed — the plain-search fallback below
+        # already tells the user what to do next; this is for someone later
+        # asking "why didn't AXISBANK/TCS/etc. end up in tickers.yaml?".
+        from mybroker.logging_setup import get_logger
+
+        get_logger(__name__).warning(
+            "AI-assisted ticker resolution failed for %d holding(s) (%s: %s) "
+            "— falling back to plain yfinance-search suggestions.",
+            len(todo), type(exc).__name__, exc,
+        )
         _suggest_via_plain_search(todo, skipped)
 
 
@@ -750,6 +716,23 @@ def _resolve_via_agent(todo: list[dict], skipped: int) -> None:
         if key in written_this_run and r.symbol and not r.duplicate_of:
             print(f"  {YELLOW}?{RESET} {r.name!r} — {r.symbol} was already added this "
                   f"run (likely the same holding as another row): {r.reasoning}")
+        elif (
+            key in pre_existing_keys and r.symbol and not r.duplicate_of
+            and r.confidence == "high"
+            and ticker_seeding.is_pristine_draft(config.TICKERS_FILE, key)
+        ):
+            # The existing entry's name is still literally the ticker
+            # itself — proof it's the deterministic draft this same
+            # holding's short-symbol source seeded, never touched by a
+            # human since. Safe to backfill the name (and sector, if the
+            # agent has one) rather than just asking a human to go do it —
+            # unlike a fresh entry, nothing about candidates/tier/bucket
+            # changes, so there's no new guess being made here.
+            ticker_seeding.backfill_draft_entry(
+                config.TICKERS_FILE, key, name=r.company_name or r.name, sector=r.sector
+            )
+            print(f"  {GREEN}✓{RESET} {r.name!r} → {BOLD}{key}{RESET} "
+                  f"{DIM}— existing DRAFT entry, backfilled its name/sector{RESET}")
         elif key in pre_existing_keys and r.symbol and not r.duplicate_of:
             print(f"  {YELLOW}?{RESET} {r.name!r} — {r.symbol} is already in tickers.yaml "
                   f"(check it covers this holding too): {r.reasoning}")
@@ -759,6 +742,23 @@ def _resolve_via_agent(todo: list[dict], skipped: int) -> None:
         elif r.symbol:
             print(f"  {YELLOW}?{RESET} {r.name!r} — possible match {BOLD}{r.symbol}{RESET} "
                   f"({r.confidence} confidence): {r.reasoning}")
+            # Only ever offered interactively — a scripted/non-interactive
+            # run (a frozen build piped in CI, say) keeps the old behaviour
+            # of just printing the line above and moving on.
+            if sys.stdin.isatty():
+                chosen = _confirm_uncertain_match(r)
+                if chosen:
+                    chosen_key = chosen.split(".")[0]
+                    if chosen_key in pre_existing_keys or chosen_key in written_this_run:
+                        print(f"    {YELLOW}!{RESET} {chosen_key} is already in "
+                              f"tickers.yaml — not overwriting it; edit that entry "
+                              f"yourself if it needs to change.")
+                    else:
+                        block = _reviewed_entry(r, chosen, edited=chosen != r.symbol)
+                        if _insert_ticker_yaml_block(config.TICKERS_FILE, block):
+                            written_this_run.add(chosen_key)
+                            print(f"    {GREEN}✓{RESET} added {BOLD}{chosen}{RESET} to "
+                                  f"tickers.yaml — still review tier/bucket")
         else:
             print(f"  {YELLOW}?{RESET} {r.name!r} — "
                   f"{r.reasoning or 'no confident match found'}")
@@ -769,7 +769,7 @@ def _resolve_via_agent(todo: list[dict], skipped: int) -> None:
 
 
 def _agent_resolved_entry(r) -> str:
-    """A higher-quality entry than _draft_ticker_entry: the candidate and
+    """A higher-quality entry than ticker_seeding.draft_ticker_entry: the candidate and
     sector come from a real search result the resolver's own validation
     gate already checked (agents/ticker_resolver.py's _validate), not a
     bare guess — so, unlike a plain DRAFT, only the single verified
@@ -788,6 +788,71 @@ def _agent_resolved_entry(r) -> str:
         f"      tier/bucket still need your own judgment either way — nothing\n"
         f"      external can tell you which bucket a stock belongs in for your\n"
         f"      own strategy.\n"
+    )
+
+
+def _confirm_uncertain_match(r) -> str | None:
+    """Interactive-only follow-up to a printed medium/low-confidence '?'
+    line: let a human accept the agent's own suggested symbol, type a
+    different one, or skip — right here, instead of leaving it as a line
+    in scrollback that's easy to miss and forces a separate trip to a text
+    editor to fix. Returns the symbol to write (accepted or edited), or
+    None to leave this holding unmapped, same as before. Never called
+    outside an interactive terminal — see its call site.
+    """
+    try:
+        answer = input(
+            f"    [a]ccept {r.symbol}, [e]dit the symbol, [s]kip? [a/e/S] "
+        ).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+
+    if answer.startswith("a"):
+        return r.symbol
+    if answer.startswith("e"):
+        try:
+            typed = input("    Symbol (e.g. TCS.NS), blank to skip: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        return typed or None
+    return None
+
+
+def _reviewed_entry(r, symbol: str, *, edited: bool) -> str:
+    """A tickers.yaml entry for a medium/low-confidence match a human just
+    confirmed or edited at `factfolio init` — distinct from
+    _agent_resolved_entry (only ever written at high confidence, never
+    edited) so the notes honestly say a human vouched for this, not just
+    the agent's own uncertain guess."""
+    if edited:
+        # r.sector (if any) was the agent's own guess for its OWN
+        # suggested symbol — carrying it over here would attach it to a
+        # ticker the agent never actually looked at.
+        name, sector = r.name, "Unknown"
+        candidates_comment = "your own edit — verify it resolves"
+        note = (
+            f"You typed {symbol!r} yourself at `factfolio init`, in place of the "
+            f"agent's own {r.confidence}-confidence guess for {r.name!r}. Verify it "
+            f"resolves (`factfolio validate`) and fill in sector/tier/bucket."
+        )
+    else:
+        name, sector = r.company_name or r.name, r.sector or "Unknown"
+        candidates_comment = f"{r.confidence} confidence — you reviewed and accepted this"
+        note = (
+            f"{r.confidence.capitalize()} confidence match from {r.name!r}, reviewed "
+            f"and accepted by you at `factfolio init`: {r.reasoning}"
+        )
+    return (
+        f"  {symbol.split('.')[0]}:\n"
+        f"    name: {name}\n"
+        f"    candidates: [{symbol}]  # {candidates_comment}\n"
+        f"    sector: {sector}\n"
+        f"    tier: unknown  # TODO: large | mid | small\n"
+        f"    bucket: satellite  # TODO: core | satellite\n"
+        f"    notes: >\n"
+        f"      {note}\n"
     )
 
 
@@ -815,6 +880,23 @@ def _print_getting_started(target: Path, tickers_file: Path) -> None:
     """Printed once init is done — where things live, what's required
     before the first real command, and what's optional. Not a "next steps"
     checklist someone has to re-derive from four different docs."""
+    # Backstop for _resolve_init_target's own (now-loud) warning about why
+    # it picked a non-default location: that warning prints before the
+    # policy interview even starts, so by the time someone's reading this
+    # final summary it may already be several screens back. Repeating the
+    # "why" right next to the "Project:" line below means it survives even
+    # if that earlier line got scrolled past.
+    default_here = target.parent / "factfolio"
+    if target.name != "factfolio" and default_here.exists():
+        reason = (
+            "a file with that exact name — maybe the factfolio executable "
+            "itself, if you copied it here"
+            if default_here.is_file()
+            else "a folder there that isn't a factfolio project"
+        )
+        print(f"\n{YELLOW}! Landed in {target.name}/, not factfolio/{RESET}"
+              f" — {DIM}{default_here} is already {reason}.{RESET}")
+
     print(f"\n{BOLD}Project:{RESET} {target}")
 
     print(f"\n{BOLD}1. Go there{RESET}")
@@ -1051,12 +1133,50 @@ def main(argv: list[str] | None = None) -> int:
                    ).set_defaults(func=cmd_cron)
 
     args = parser.parse_args(argv)
+
+    # Every command except init/bare `factfolio` (welcome) must refuse
+    # outright rather than scaffold a second, empty project layout beside
+    # the real one — see _standing_beside_own_project's own docstring.
+    # Checked BEFORE anything else touches disk (ensure_dirs(), the logger
+    # below, all of it), since that's the only way to guarantee nothing
+    # gets created at the wrong root.
+    if args.command not in (None, "init") and _standing_beside_own_project():
+        target = Path.cwd() / "factfolio"
+        print(f"{YELLOW}! Your factfolio project is in {target}, not here "
+              f"— run `cd {target.name}` first.{RESET}", file=sys.stderr)
+        print(f"  {DIM}Running `factfolio {args.command}` from {Path.cwd()} "
+              f"would otherwise scaffold a second, empty copy of logs/"
+              f"reports/memory/holdings_inbox right beside it.{RESET}",
+              file=sys.stderr)
+        return 1
+
+    from mybroker.logging_setup import get_logger
+
+    # init/welcome can redirect PROJECT_ROOT mid-flight (into a nested
+    # `factfolio/` folder they reuse or create — see _resolve_init_target).
+    # Logging here, before that redirect, would scaffold logs/ (and, via
+    # ensure_dirs(), memory/reports/holdings_inbox/ too) at the OLD root —
+    # exactly the stray-duplicate-folder bug this whole check exists to
+    # prevent, just self-inflicted via the logger instead of a subcommand.
+    # Every other command's PROJECT_ROOT is stable for the whole process,
+    # so logging "started" up front is safe for those.
+    if args.command not in (None, "init"):
+        get_logger("mybroker.cli").info("factfolio %s started", args.command)
+
     try:
-        return args.func(args)
+        rc = args.func(args)
+        get_logger("mybroker.cli").info(
+            "factfolio %s finished (exit %d)", args.command, rc
+        )
+        return rc
     except FileNotFoundError as exc:
+        # Expected, user-actionable states (no holdings yet, no policy
+        # file) — not a crash, so a WARNING here, not an ERROR/traceback.
+        get_logger("mybroker.cli").warning("factfolio %s: %s", args.command, exc)
         print(f"{RED}✗{RESET} {exc}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
+        get_logger("mybroker.cli").info("factfolio %s interrupted", args.command)
         print("\ninterrupted", file=sys.stderr)
         return 130
     except Exception as exc:
@@ -1068,6 +1188,11 @@ def main(argv: list[str] | None = None) -> int:
         from mybroker.errors import friendly_message, log_error
 
         log_file = log_error(f"factfolio {args.command}", exc)
+        get_logger("mybroker.cli").error(
+            "factfolio %s failed: %s: %s%s", args.command,
+            type(exc).__name__, exc,
+            f" (full traceback: {log_file})" if log_file else "",
+        )
         print(f"\n{RED}✗{RESET} `factfolio {args.command}` failed: "
               f"{friendly_message(exc)}", file=sys.stderr)
         if log_file:
