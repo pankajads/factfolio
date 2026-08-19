@@ -203,8 +203,14 @@ formatted table.
 Drop the standard Zerodha `holdings.csv` (and optionally `holdings_mf.csv`)
 at the project root as before, **or** drop any broker export — csv, xls,
 xlsx, pdf, or txt, equity or mutual fund, any filename — into `holdings_inbox/`.
-Each file is sniffed and classified automatically; `factfolio status` /
-`report` merge everything found there with the root files.
+Each file is sniffed and classified automatically, column names and all
+(`Avg Rate`/`Average Price`/`Buy Price`, an `.xls` that's actually HTML,
+…); `factfolio status` / `report` merge everything found there with the
+root files, combining the same stock held across multiple
+accounts/brokers into one position. Password-protected PDFs (CAMS/
+KFintech/NSDL/CDSL CAS statements) work too — see
+[`docs/USER_GUIDE.md`](docs/USER_GUIDE.md#3-add-your-holdings) for how to
+supply the password.
 
 ### Unattended grading (`factfolio cron`)
 

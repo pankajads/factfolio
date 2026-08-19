@@ -8,11 +8,32 @@ column that cannot be interpreted is an error, never a silent zero.
 from __future__ import annotations
 
 import csv
-from dataclasses import dataclass, field
+import re
+from dataclasses import dataclass, field, replace
 from datetime import date
 from pathlib import Path
 
-from mybroker.config import HOLDINGS_EQUITY, HOLDINGS_INBOX_DIR, HOLDINGS_MF, symbol_meta
+from mybroker.config import (
+    HOLDINGS_EQUITY,
+    HOLDINGS_INBOX_DIR,
+    HOLDINGS_MF,
+    cd_hint_if_project_nearby,
+    resolve_symbol_by_name,
+    symbol_meta,
+)
+
+# RBI/government bonds and Sovereign Gold Bonds sometimes show up in a demat
+# "holdings" export alongside actual equity (e.g. "2.50% JAN29 SERIES X FY
+# 2020-2", "2.50%GOLDBONDS2029SR-IX") — this tool only analyses equity and
+# mutual funds (see README). Counting a bond as an unclassified
+# "Unknown"-sector stock would misstate both its own P&L context and the
+# portfolio's sector concentration, so it's excluded (with a warning naming
+# it), not silently mis-typed.
+_BOND_LIKE = re.compile(r"^\d+(\.\d+)?%|GOLD\s*BOND|\bSGB\b", re.IGNORECASE)
+
+
+def _looks_like_a_bond(display_text: str) -> bool:
+    return bool(_BOND_LIKE.search(display_text))
 
 # Zerodha's headers, normalised (lowercased, punctuation stripped) → our field.
 _EQUITY_COLUMNS = {
@@ -76,6 +97,72 @@ class EquityPosition:
     @property
     def pnl_pct(self) -> float:
         return (self.pnl / self.invested * 100) if self.invested else 0.0
+
+
+def _resolve_position(pos: EquityPosition, *, source: str = "") -> str | None:
+    """Attach tickers.yaml metadata to `pos`, falling back to matching its
+    full company name (see resolve_symbol_by_name) when an exact-symbol
+    lookup misses — some sources (a demat holdings PDF, say) only have a
+    display name, not a trading symbol, to key off of. Canonicalizes
+    `pos.symbol` to the resolved tickers.yaml key either way, so the same
+    stock recorded under different display names/lots still merges into
+    one position later (see _merge_same_symbol_lots). Returns a warning
+    string if nothing resolved, else None.
+    """
+    prefix = f"{source}: " if source else ""
+    try:
+        meta = symbol_meta(pos.symbol)
+    except KeyError:
+        resolved = resolve_symbol_by_name(pos.symbol)
+        if resolved is None:
+            return (
+                f"{prefix}{pos.symbol} is not in tickers.yaml — no market data, "
+                f"sector, or policy classification will be available for it."
+            )
+        pos.symbol = resolved
+        meta = symbol_meta(resolved)
+
+    pos.name = meta.get("name", pos.symbol)
+    pos.sector = meta.get("sector", "Unknown")
+    pos.tier = meta.get("tier", "unknown")
+    pos.bucket = meta.get("bucket", "satellite")
+    return None
+
+
+def _merge_same_symbol_lots(positions: list[EquityPosition]) -> list[EquityPosition]:
+    """Combine multiple lots of the same resolved symbol into one position.
+
+    A stock split across two demat accounts, or recorded as separate lots
+    by a DP's own back office (a corporate action, a batch of trades), is
+    still one real exposure — max_position_pct and concentration (HHI) are
+    about total exposure to a stock, not how many statements/accounts it
+    happens to be spread across. Leaving lots unmerged can let a real
+    breach hide beneath the cap in every individual row.
+
+    Symbols that never resolved (still a raw, unmapped display name) merge
+    too, but only with an exact-string match of that same raw name — two
+    different unmapped spellings of the same company stay separate until
+    tickers.yaml actually maps them, same "never guess" rule as everywhere
+    else here.
+    """
+    merged: dict[str, EquityPosition] = {}
+    for p in positions:
+        if p.symbol not in merged:
+            merged[p.symbol] = replace(p)
+            continue
+        existing = merged[p.symbol]
+        existing.quantity += p.quantity
+        existing.invested += p.invested
+        existing.current_value += p.current_value
+        existing.pnl += p.pnl
+        existing.avg_cost = (
+            existing.invested / existing.quantity if existing.quantity else existing.avg_cost
+        )
+        existing.ltp = p.ltp or existing.ltp
+        # net_change_pct/day_change_pct are point-in-time broker figures,
+        # not additive across lots — deliberately left as the first lot's,
+        # not summed into something that isn't a percentage of anything real.
+    return list(merged.values())
 
 
 @dataclass
@@ -189,6 +276,9 @@ def load_equity(path: Path | None = None) -> tuple[list[EquityPosition], list[st
                 continue  # blank line / trailing newline
 
             symbol = row[idx["symbol"]].strip().upper()
+            if _looks_like_a_bond(symbol):
+                warnings.append(f"{symbol!r} looks like a bond/gold bond, not equity — excluded.")
+                continue
 
             def get(fname: str, _row=row, _n=rownum) -> float:
                 if fname not in idx:
@@ -211,17 +301,9 @@ def load_equity(path: Path | None = None) -> tuple[list[EquityPosition], list[st
                 net_change_pct=get("net_change_pct"),
             )
 
-            try:
-                meta = symbol_meta(symbol)
-                pos.name = meta.get("name", symbol)
-                pos.sector = meta.get("sector", "Unknown")
-                pos.tier = meta.get("tier", "unknown")
-                pos.bucket = meta.get("bucket", "satellite")
-            except KeyError:
-                warnings.append(
-                    f"{symbol} is not in tickers.yaml — no market data, sector, or "
-                    f"policy classification will be available for it."
-                )
+            warning = _resolve_position(pos)
+            if warning:
+                warnings.append(warning)
 
             positions.append(pos)
 
@@ -364,8 +446,15 @@ def load_portfolio(
         raise FileNotFoundError(
             f"No equity holdings found. Export from Kite → Holdings → download "
             f"to {HOLDINGS_EQUITY}, or drop any csv/xls/xlsx/pdf/txt export into "
-            f"{HOLDINGS_INBOX_DIR}/."
+            f"{HOLDINGS_INBOX_DIR}/.{cd_hint_if_project_nearby()}"
         )
+
+    # Merge lots of the same resolved symbol — real for anyone holding a
+    # stock across multiple demat accounts/brokers, or whose DP recorded it
+    # as separate lots after a corporate action. See
+    # _merge_same_symbol_lots's own docstring for why this has to happen
+    # before weights/concentration are computed, not just for display.
+    equity = _merge_same_symbol_lots(equity)
 
     if not mfs and not mf_result_present:
         warnings.append(

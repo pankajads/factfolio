@@ -315,6 +315,91 @@ now, on principle, not just because the bugs got fixed.
 - `packaging/factfolio.spec` simplified accordingly — no more Streamlit
   static-asset collection, the single most fragile part of the old build.
 
+## M7 — Agent-assisted ticker resolution
+
+**Status: done.**
+
+`factfolio init`'s plain yfinance-search suggestion (a single fuzzy lookup
+per unmapped full-name holding, `config.suggest_ticker_for_name`) has a
+real ceiling: it can't reason about ambiguity, so it either guesses or
+punts every case identically. A demat holdings PDF's "Scrip Name" column
+often has exactly the cases where that ceiling matters — the same holding
+recorded twice under slightly different names, or a corporate action
+(Tata Motors' 2024 demerger) that makes "the obvious answer" genuinely
+wrong.
+
+`agents/ticker_resolver.py` — one narrow, single-tool agent turn, not the
+full M2 orchestrator:
+
+- The agent gets exactly one tool, `search_ticker_by_name` (a live
+  yfinance company-name search filtered to real NSE/BSE equity listings),
+  and every unmapped holding's name **and quantity** in one batch, so it
+  can reason about cross-row duplicates itself rather than resolving each
+  name in isolation.
+- **Code-level validation, not just a prompted rule**: a claimed symbol
+  must appear in that exact name's own recorded search results or it's
+  rejected regardless of stated confidence — the same "a claim must trace
+  to a real tool call" discipline `tools/server.py`'s provenance validator
+  already enforces for report recommendations, reimplemented here directly
+  since this task's evidence shape doesn't fit that validator's schema.
+- Only "high confidence, validated, not flagged as a duplicate, symbol not
+  already in `tickers.yaml`" resolutions get auto-written — with a real
+  sector from the same evidence, not a bare guess. A code-level dedupe
+  guard also catches a same-symbol collision the agent's own prompted
+  duplicate-detection missed (verified in practice — see below).
+  Everything else prints the agent's own reasoning for a human to decide.
+- Falls back to the plain single-search suggestion (no reasoning, never
+  auto-written) if the agent path fails for any reason — no `claude`
+  login, network, a malformed response — since this stays convenience,
+  never a gate that could block `init`.
+
+Verified against a real (sanitized) demat statement, live: correctly
+identified `NTPC LIMITED`/`NTPC LTD` as the same holding recorded twice
+(matching quantity, legal-suffix-only name difference) and reasoned
+correctly about the Tata Motors demerger — high confidence for the entity
+that legally retained the "Tata Motors Limited" name post-split, medium/
+flagged for the genuinely ambiguous sibling row, rather than guessing
+either way. Separately, the code-level dedupe guard caught a same-symbol
+collision (`TATA POWER CO LTD` / `TATA POWER CO. LTD.`, both resolving to
+`TATAPOWER.NS`) that the agent itself had reasoned were *not* duplicates
+(different quantities, plausible separate lots) — both readings can be
+right at once (same symbol, still two real lots), which is exactly why
+the tickers.yaml-entry decision and the lot-merging decision
+(`loader._merge_same_symbol_lots`) are kept as two separate steps rather
+than one.
+
+## M8 — New-idea screening (core-satellite candidates outside current holdings)
+
+**Status: not started — scoped, deliberately deferred.**
+
+Everything to this point analyses stocks/funds you *already hold* —
+`tickers.yaml` only ever contains your own portfolio, and there's no
+broader universe to draw from. This milestone is a genuinely different
+capability: surfacing new candidates you don't currently hold, not just
+auditing what's there.
+
+Explicitly scoped down from "screen all of NSE" (~2,000 listed stocks) to
+keep it tractable and consistent with the project's own "no forecasts, no
+predictions" stance:
+
+- **Bounded per sector, not universe-wide**: shortlist the top 10
+  candidates per sector by fundamentals (the existing `get_screener_ratios`/
+  `get_fundamentals`-style evidence, not a new prediction model) — never
+  more than 10 tracked per sector at a time.
+- **Portfolio construction rule**: no more than 3–4 actual holdings per
+  sector at once, drawn from that shortlist.
+- **Periodic review, not continuous**: re-run the screen monthly or
+  quarterly and rotate positions out if a holding no longer clears the
+  bar, rather than reacting to daily price moves.
+- Needs a real, bounded universe source first (e.g. NSE's own equity
+  list per sector) — nothing in the codebase currently maintains one
+  outside of what a user has personally added to `tickers.yaml`.
+
+Not building this now because it's a different scale of problem (screening
+a universe vs. reasoning about your own evidence) and deserves its own
+design pass, not an addition bolted onto the holdings-ingestion work this
+round was actually about.
+
 ## Remaining gaps
 
 - **`compute_overlap` is still honestly blocked.** MF holdings are now real
