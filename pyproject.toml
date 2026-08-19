@@ -1,6 +1,6 @@
 [project]
 name = "factfolio"
-version = "0.3.0"
+version = "0.4.0"
 description = "FactFolio — open-source, evidence-based portfolio advisory for Indian equity & mutual funds. Every number traceable to a tool call, never a guess."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -44,6 +44,11 @@ dependencies = [
     "openpyxl>=3.1.5",
     "pdfplumber>=0.11.10",
     "beautifulsoup4>=4.15.0",
+    # Already a transitive dep of yfinance; declared directly since
+    # portfolio/importers.py uses it directly too, as pandas.read_html's
+    # parser backend — some broker "Excel" exports are actually an HTML
+    # table saved with an .xls/.xlsx extension.
+    "lxml>=5.0",
 ]
 
 [project.urls]
@@ -58,6 +63,10 @@ dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
     "ruff>=0.7",
+    # Test-only: builds an encrypted PDF fixture for the password-protected
+    # PDF tests (CAMS/KFintech/NSDL/CDSL CAS statements) — never imported
+    # at runtime, pdfplumber does the actual reading.
+    "pypdf>=5.0",
 ]
 # Only needed to build the standalone per-OS executables (release CI, or
 # `uv sync --extra build` locally) — not a runtime dependency.

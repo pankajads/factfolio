@@ -25,7 +25,7 @@ uv run factfolio init
 cd factfolio
 ```
 
-`factfolio init` does four things, safe to re-run any time:
+`factfolio init` does six things, safe to re-run any time:
 
 1. Creates a dedicated `factfolio/` project folder under wherever you ran
    it (yes, this means `factfolio/factfolio/` right after a fresh clone —
@@ -49,7 +49,16 @@ cd factfolio
 3. Seeds your own `tickers.yaml` at the project root, copied from the
    bundled defaults — yours to add symbols to from then on (see
    [§3](#3-add-your-holdings)). Never overwritten on a re-run either.
-4. Prints exactly where it landed and what to do next.
+4. Scans `holdings.csv`/`holdings_inbox/` for symbols you hold that
+   aren't mapped yet and adds a DRAFT entry for each — see
+   [§3](#3-add-your-holdings) for exactly what qualifies and what a
+   drafted entry looks like. Re-running `init` after adding a new holding
+   picks up just the new symbol, never re-touching an existing entry.
+5. For holdings that only have a full company name (no genuine symbol to
+   draft from), asks an agent to research and resolve each one — see
+   [§3](#3-add-your-holdings) for what it can and can't safely decide on
+   its own, and what it falls back to without a `claude` login.
+6. Prints exactly where it landed and what to do next.
 
 Every command below this point — and the rest of this guide — assumes
 you've `cd`ed into that `factfolio/` project folder. That checklist is
@@ -66,25 +75,99 @@ Qty., Avg. cost, LTP, Invested, Cur. val, P&L, Net chg., Day chg.` — that's
 exactly what Kite's own export produces, nothing to edit.
 
 **Anything else — any broker, any format:** drop the file into
-`holdings_inbox/`, unmodified. Supported formats: **csv, xls, xlsx, pdf, txt**.
-It's sniffed automatically — header row located by keyword, classified as
+`holdings_inbox/`, unmodified. Supported formats: **csv, xls, xlsx, pdf, txt**
+(an `.xls`/`.xlsx` that's actually an HTML table saved with that extension —
+common with some banks/brokers — is also handled automatically). It's
+sniffed automatically — header row located by keyword, classified as
 equity or mutual-fund, parsed regardless of the exact column names your
-broker used. A file it can't confidently classify raises an error naming
-the file, rather than silently doing nothing. Mutual-fund statements go in
-the same folder; `holdings_mf.csv` at the root also still works if you'd
-rather hand-build one.
+broker used (`Avg Rate`/`Average Price`/`Buy Price` all mean the same
+thing as `Avg. cost`, for example). A file it can't confidently classify
+raises an error naming the file, rather than silently doing nothing.
+Mutual-fund statements go in the same folder; `holdings_mf.csv` at the
+root also still works if you'd rather hand-build one.
+
+**Password-protected PDFs** (a CAMS/KFintech mutual-fund CAS statement, or
+an NSDL/CDSL depository CAS) work too: put the password in a sidecar file
+named `<the pdf's filename>.password` right next to it in `holdings_inbox/`
+(e.g. `Statement.pdf.password`, plain text, just the password — gitignored
+along with everything else in that folder), or set `FACTFOLIO_PDF_PASSWORD`
+if every encrypted file shares one. Neither convention is obvious up
+front: CAMS/KFintech CAS statements use your PAN in **UPPERCASE**;
+NSDL/CDSL CAS statements use PAN+date-of-birth (`DDMMYYYY`) — the exact
+format is always in the email that sent you the statement.
 
 Both sources merge automatically — you can have `holdings.csv` at the root
 *and* other files in `holdings_inbox/` at the same time; there's no need to
-consolidate everything into one file.
+consolidate everything into one file. The same stock held across multiple
+files/accounts is combined into one position for analysis — see the ticker
+mapping section below for exactly how.
 
 **Every holding needs a ticker mapping.** `factfolio init` seeded your own
 `tickers.yaml` at the project root, copied from the bundled defaults —
-open it and add an entry for each symbol you hold that isn't already there
-(it ships with the maintainer's own portfolio's symbols as examples —
-yours will be different). It's yours from that point on: edits persist
-across runs and upgrades, on every install method including the standalone
-executable, unlike editing the package's own bundled copy directly.
+it's yours from that point on: edits persist across runs and upgrades, on
+every install method including the standalone executable, unlike editing
+the package's own bundled copy directly.
+
+Every time you run `init` (the first time and every re-run after), it also
+scans `holdings.csv` and everything in `holdings_inbox/` and adds a
+**DRAFT** entry for any symbol it finds that isn't mapped yet — but only
+from a source with a genuine short trading-symbol column (Zerodha's
+`Instrument`, a generic `Symbol` column); a source with only a full
+company name (a demat holdings PDF, say) has no reliable symbol to derive,
+so those still just warn instead of being guessed at. A drafted entry
+looks like this — `candidates` is an unverified guess `factfolio validate`
+will empirically confirm or reject, and `sector`/`tier`/`bucket` stay
+honestly `Unknown`/`unknown` rather than guessed, since nothing in a
+holdings file says what sector a stock is in:
+
+```yaml
+NEWSTOCK:
+  name: NEWSTOCK  # TODO: replace with the real company name
+  candidates: [NEWSTOCK.NS, NEWSTOCK.BO]  # DRAFT — unverified guess
+  sector: Unknown  # TODO
+  tier: unknown  # TODO: large | mid | small
+  bucket: satellite  # TODO: core | satellite
+```
+
+Review and fill in every drafted entry before relying on it — that's the
+whole point of marking it DRAFT rather than pretending it's done.
+
+A source with only a full company name (no genuine symbol column) still
+can't be safely auto-*drafted* — real accounts confirmed why: the same
+company-name search that resolves `AXIS BANK LIMITED` correctly can also
+return a London GDR or a Brazilian BDR alongside it, and returns nothing
+at all for a company that's since been renamed (Zomato → Eternal is the
+concrete example baked into this project's own history). Guessing wrong
+here means silently wrong sector/policy numbers, so a bare guess is never
+auto-written. `init` still helps a lot here, though — with a `claude`
+login available, it hands each unmapped name to a small agent
+(`agents/ticker_resolver.py`) that searches, reasons about likely
+duplicates across your other holdings (the same stock recorded twice
+under a slightly different name, say), and rates its own confidence. Only
+"high confidence, no duplicate flag" resolutions — each one checked in
+code against the actual search result it's grounded in, not just asked
+for — get written straight to `tickers.yaml`, sector included:
+
+```
+Asking an agent to resolve 2 unmapped holding name(s)…
+  ✓ 'AXIS BANK LIMITED' → AXISBANK.NS — added to tickers.yaml; still review tier/bucket
+  ? 'NTPC LTD' — looks like the same holding as 'NTPC LIMITED': same NTPC.NS match,
+    identical quantity, legal-suffix-only name difference — likely recorded twice.
+```
+
+No `claude` login, no network, or anything the agent can't parse cleanly
+falls back to a single plain yfinance-search suggestion per name instead —
+no reasoning, never auto-written, just a likely ticker to verify yourself:
+
+```
+Looking up possible matches for 1 unmapped holding name(s) via yfinance…
+  ? 'AXIS BANK LIMITED' — possible match AXISBANK.NS — verify, then add it to tickers.yaml yourself
+```
+
+Either way, `tier`/`bucket` are never filled in automatically — no
+external source can tell you which bucket a stock belongs in for your own
+strategy, so that stays your call regardless of how the symbol itself got
+resolved.
 
 ```yaml
 symbols:
@@ -102,6 +185,29 @@ This is deliberate friction, not an oversight: the system never guesses a
 ticker (a naive `f"{symbol}.NS"` silently breaks on renames and demergers —
 see `tickers.yaml`'s own header comment for real examples), so every symbol
 must be mapped explicitly before it can be analysed.
+
+**Holding the same stock across multiple brokers/demat accounts, or from a
+source with only a company name and no short symbol (a bank/DP holdings
+PDF, say)?** Two things happen automatically once you've added the symbol
+once:
+
+- A row whose "symbol" column is actually a full company name (`HDFC BANK
+  LTD.`) matches your `tickers.yaml` entry by its `name:` field — case,
+  punctuation, and `Ltd`/`Ltd.`/`Limited` all normalized away — so you
+  don't need a separate entry per spelling variant a statement happens to
+  use. This only ever resolves when exactly one entry matches; an
+  unrecognised or ambiguous name still stays unmapped and warns, same as
+  any other unmapped symbol — it's never guessed.
+- Every lot of the same resolved symbol — split across accounts, brokers,
+  or recorded separately by a DP after a corporate action — is summed into
+  one combined position before concentration and position-size limits are
+  checked, so your real total exposure to a stock is what gets measured,
+  not whatever fraction of it happens to sit in one file.
+
+A rename or demerger that genuinely produces two *different* entities
+(Tata Motors' 2024 split into TMCV/TMPV, say) is deliberately **not**
+auto-merged even if the names look related — that call needs a human, not
+a heuristic.
 
 Then resolve everything:
 

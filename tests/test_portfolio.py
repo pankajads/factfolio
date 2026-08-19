@@ -261,6 +261,112 @@ class TestInboxImport:
         assert merged.has_mutual_funds
         assert len(merged.mutual_funds) >= 7
 
+    def test_equity_derives_invested_and_current_value_from_qty(self, tmp_path):
+        """Real-world regression: a broker PDF export whose header uses
+        'Avg Rate' (not 'avg cost'/'avg price') and 'Holding Value' —
+        ambiguous, could mean cost basis or current value depending on the
+        broker, so rather than guess, invested/current_value are derived
+        from qty*avg_cost / qty*ltp instead of trusting that column at all.
+        The exact header reported: ['Scrip Name', '', 'Total Qty',
+        'Avg Rate', 'Holding Value', '', 'LTP', 'Market Value',
+        'PL (Rs.)', 'PL%']."""
+        from mybroker.portfolio.importers import extract_positions
+
+        path = tmp_path / "holdings.csv"
+        path.write_text(
+            "Scrip Name,,Total Qty,Avg Rate,Holding Value,,LTP,Market Value,"
+            "PL (Rs.),PL%\n"
+            "INFY,,10,1500.00,999999,,1600.00,16000.00,1000.00,6.67\n"
+        )
+
+        kind, positions, _warnings = extract_positions(path)
+        assert kind == "equity"
+        pos = positions[0]
+        assert pos.symbol == "INFY"
+        # Derived from qty*avg_cost (10*1500), NOT the ambiguous "Holding
+        # Value" column (999999) — proves it's genuinely ignored, not
+        # coincidentally correct.
+        assert pos.invested == pytest.approx(15_000.0)
+        assert pos.current_value == pytest.approx(16_000.0)  # qty*ltp
+        assert pos.pnl == pytest.approx(1_000.0)  # current_value - invested
+
+    def test_equity_still_requires_avg_cost_or_invested_column(self, tmp_path):
+        """Can't derive invested without avg_cost, and there's no explicit
+        invested column either — must still raise, naming the file, not
+        silently default to 0."""
+        from mybroker.portfolio.importers import extract_positions
+
+        path = tmp_path / "holdings.csv"
+        path.write_text("Scrip Name,Total Qty,LTP,Market Value\nINFY,10,1600,16000\n")
+
+        with pytest.raises(ValueError, match="avg_cost"):
+            extract_positions(path)
+
+    def test_xls_that_is_actually_html_still_parses(self, tmp_path):
+        """Plenty of Indian broker/bank 'Excel' exports are actually an HTML
+        table saved with an .xls extension, not a real binary workbook.
+        pandas.read_excel can't identify a format from that content and
+        raises "Excel file format cannot be determined, you must specify an
+        engine manually" rather than guessing — this is the exact error a
+        user hit in the wild. A second, unrelated <table> (e.g. a letterhead
+        or disclaimer) must not confuse the header-scan either."""
+        pytest.importorskip("lxml")
+        path = tmp_path / "holdings.xls"
+        path.write_text("""
+            <html><body>
+            <table><tr><td>Client Statement — Confidential</td></tr></table>
+            <table>
+              <tr><th>Instrument</th><th>Qty.</th><th>Avg. cost</th>
+                  <th>Invested</th><th>Cur. val</th></tr>
+              <tr><td>INFY</td><td>10</td><td>1,500.00</td>
+                  <td>15,000.00</td><td>16,000.00</td></tr>
+              <tr><td>TCS</td><td>5</td><td>3,200.00</td>
+                  <td>16,000.00</td><td>17,000.00</td></tr>
+              <tr><td>Total</td><td></td><td></td><td>31,000.00</td><td>33,000.00</td></tr>
+            </table>
+            </body></html>
+        """)
+
+        from mybroker.portfolio.importers import extract_positions
+
+        kind, positions, _warnings = extract_positions(path)
+        assert kind == "equity"
+        assert {p.symbol for p in positions} == {"INFY", "TCS"}
+        assert sum(p.invested for p in positions) == pytest.approx(31_000.0)
+
+    def test_xls_that_is_actually_html_without_th_tags_still_parses(self, tmp_path):
+        """Header row via plain <td>, not <th> — pandas.read_html only
+        auto-promotes a real <th> row to column labels; a <td>-only header
+        must survive as an ordinary row for the header-scan to find."""
+        pytest.importorskip("lxml")
+        path = tmp_path / "holdings.xls"
+        path.write_text("""
+            <html><body><table>
+              <tr><td>Instrument</td><td>Qty.</td><td>Avg. cost</td>
+                  <td>Invested</td><td>Cur. val</td></tr>
+              <tr><td>INFY</td><td>10</td><td>1,500.00</td>
+                  <td>15,000.00</td><td>16,000.00</td></tr>
+            </table></body></html>
+        """)
+
+        from mybroker.portfolio.importers import extract_positions
+
+        kind, positions, _warnings = extract_positions(path)
+        assert kind == "equity"
+        assert [p.symbol for p in positions] == ["INFY"]
+
+    def test_genuinely_corrupt_xls_still_raises(self, tmp_path):
+        """Not every "cannot be determined" file is secretly HTML — a
+        truly corrupt/empty file must still fail loudly, naming the file,
+        not disappear into a silent empty result."""
+        path = tmp_path / "holdings.xls"
+        path.write_bytes(b"this is neither Excel nor HTML")
+
+        from mybroker.portfolio.importers import extract_positions
+
+        with pytest.raises(ValueError, match="holdings.xls"):
+            extract_positions(path)
+
     def test_unrecognisable_file_raises_naming_the_file(self, tmp_path):
         from mybroker.portfolio.importers import extract_positions
 
@@ -298,3 +404,551 @@ class TestInboxImport:
 
         grid = _read_txt_grid(path)
         assert grid == [["Instrument"], ["INFY"], ["TCS"]]
+
+
+# ── Bonds excluded, name-based resolution, cross-source lot merging ─────────
+# Real-world regression from a Sharekhan demat holdings PDF: bonds listed
+# alongside equity, and the same stock recorded under slightly different
+# name spellings within one statement AND across a second broker's
+# holdings.csv (the two accounts share some holdings, e.g. HDFC Bank).
+@pytest.fixture
+def fake_tickers(monkeypatch):
+    """An isolated tickers.yaml — using the real one would make these tests
+    fragile to unrelated edits of it, and they don't need real yfinance
+    candidates anyway."""
+    data = {
+        "symbols": {
+            "HDFCBANK": {
+                "name": "HDFC Bank Ltd", "sector": "Banking",
+                "tier": "large", "bucket": "core",
+            },
+            "TATASTEEL": {
+                "name": "Tata Steel Ltd", "sector": "Metals",
+                "tier": "large", "bucket": "satellite",
+            },
+        },
+        "indices": {},
+    }
+    monkeypatch.setattr("mybroker.config.load_tickers", lambda: data)
+    return data
+
+
+class TestDraftSymbolDiscovery:
+    """discover_equity_symbols_for_drafting — the scan behind `factfolio
+    init`'s draft tickers.yaml entries. Deliberately independent of
+    tickers.yaml/symbol_meta: it only asks "does this look like a genuine
+    short trading symbol", never whether it's already mapped."""
+
+    def test_finds_symbols_from_a_genuine_symbol_column(self, tmp_path):
+        from mybroker.portfolio.importers import discover_equity_symbols_for_drafting
+
+        path = tmp_path / "holdings.csv"
+        path.write_text(
+            '"Instrument","Qty.","Avg. cost","LTP","Invested","Cur. val"\n'
+            '"INFY",10,1500,1600,15000,16000\n'
+            '"TCS",5,3200,3400,16000,17000\n'
+        )
+
+        assert discover_equity_symbols_for_drafting(path) == {"INFY", "TCS"}
+
+    def test_skips_a_full_company_name_column(self, tmp_path):
+        """'Scrip Name' says "name" right in the header — no reliable way
+        to derive a real trading symbol from that text, so nothing is
+        discovered rather than guessing."""
+        from mybroker.portfolio.importers import discover_equity_symbols_for_drafting
+
+        path = tmp_path / "holdings.csv"
+        path.write_text(
+            "Scrip Name,Total Qty,Avg Rate,Invested,Current Value\n"
+            "HDFC BANK LTD.,4,851.71,3406.85,2926.20\n"
+        )
+
+        assert discover_equity_symbols_for_drafting(path) == set()
+
+    def test_excludes_bond_like_rows(self, tmp_path):
+        from mybroker.portfolio.importers import discover_equity_symbols_for_drafting
+
+        path = tmp_path / "holdings.csv"
+        path.write_text(
+            '"Instrument","Qty.","Avg. cost","LTP","Invested","Cur. val"\n'
+            '"2.50%GOLDBONDS2029SR-IX",1,5000,5100,5000,5100\n'
+            '"INFY",10,1500,1600,15000,16000\n'
+        )
+
+        assert discover_equity_symbols_for_drafting(path) == {"INFY"}
+
+    def test_returns_empty_on_unparseable_file_rather_than_raising(self, tmp_path):
+        """Best-effort by design — a malformed file here must never block
+        `init`; only `validate`/`status` actually enforce correctness."""
+        from mybroker.portfolio.importers import discover_equity_symbols_for_drafting
+
+        path = tmp_path / "mystery.csv"
+        path.write_text("nothing that looks like a header at all\nfoo,bar\n")
+
+        assert discover_equity_symbols_for_drafting(path) == set()
+
+    def test_returns_empty_for_a_mutual_fund_file(self, tmp_path):
+        from mybroker.portfolio.importers import discover_equity_symbols_for_drafting
+
+        path = tmp_path / "mf.csv"
+        path.write_text(
+            "Folio,Scheme Name,Units,Avg NAV,Current NAV\n"
+            "123,Some Large Cap Fund,10,100,110\n"
+        )
+
+        assert discover_equity_symbols_for_drafting(path) == set()
+
+
+class TestUnmappedNameDiscovery:
+    """discover_unmapped_full_names — the mirror image of
+    TestDraftSymbolDiscovery, behind cmd_init's yfinance-search
+    *suggestions* (never auto-written, see _suggest_ticker_matches)."""
+
+    def test_finds_names_from_a_full_name_column(self, tmp_path):
+        from mybroker.portfolio.importers import discover_unmapped_full_names
+
+        path = tmp_path / "holdings.csv"
+        path.write_text(
+            "Scrip Name,Total Qty,Avg Rate,Invested,Current Value\n"
+            "AXIS BANK LIMITED,39,1331.66,51934.82,45290.70\n"
+        )
+
+        holdings = discover_unmapped_full_names(path)
+        assert [h["name"] for h in holdings] == ["AXIS BANK LIMITED"]
+        assert holdings[0]["quantity"] == 39
+        assert holdings[0]["avg_cost"] == pytest.approx(1331.66)
+
+    def test_skips_a_genuine_symbol_column(self, tmp_path):
+        from mybroker.portfolio.importers import discover_unmapped_full_names
+
+        path = tmp_path / "holdings.csv"
+        path.write_text(
+            '"Instrument","Qty.","Avg. cost","LTP","Invested","Cur. val"\n'
+            '"INFY",10,1500,1600,15000,16000\n'
+        )
+
+        assert discover_unmapped_full_names(path) == []
+
+    def test_excludes_a_name_already_resolvable_via_tickers_yaml(
+        self, tmp_path, fake_tickers
+    ):
+        """HDFCBANK is in fake_tickers with name 'HDFC Bank Ltd' — a name
+        variant of it needs no suggestion, since it already resolves."""
+        from mybroker.portfolio.importers import discover_unmapped_full_names
+
+        path = tmp_path / "holdings.csv"
+        path.write_text(
+            "Scrip Name,Total Qty,Avg Rate,Invested,Current Value\n"
+            "HDFC BANK LTD.,4,851.71,3406.85,2926.20\n"
+        )
+
+        assert discover_unmapped_full_names(path) == []
+
+    def test_excludes_bond_like_rows(self, tmp_path):
+        from mybroker.portfolio.importers import discover_unmapped_full_names
+
+        path = tmp_path / "holdings.csv"
+        path.write_text(
+            "Scrip Name,Total Qty,Avg Rate,Invested,Current Value\n"
+            "2.50%GOLDBONDS2029SR-IX,1,5000,5000,5100\n"
+        )
+
+        assert discover_unmapped_full_names(path) == []
+
+    def test_deduplicates_repeated_names_within_one_file(self, tmp_path):
+        from mybroker.portfolio.importers import discover_unmapped_full_names
+
+        path = tmp_path / "holdings.csv"
+        path.write_text(
+            "Scrip Name,Total Qty,Avg Rate,Invested,Current Value\n"
+            "AXIS BANK LIMITED,39,1331.66,51934.82,45290.70\n"
+            "AXIS BANK LIMITED,39,1331.66,51934.82,45290.70\n"
+        )
+
+        assert len(discover_unmapped_full_names(path)) == 1
+
+
+class TestSuggestTickerForName:
+    """suggest_ticker_for_name — a SUGGESTION only, never written to
+    tickers.yaml automatically. yfinance.Search is always mocked here:
+    a live network call has no place in this test suite (slow, flaky,
+    and not what these tests are actually verifying — the NSE/BSE
+    filtering and NS-preferred-over-BO logic don't need real data)."""
+
+    @staticmethod
+    def _mock_search(quotes):
+        class _FakeSearch:
+            def __init__(self, *_a, **_kw):
+                self.quotes = quotes
+
+        return _FakeSearch
+
+    def test_prefers_nse_over_bse_and_filters_foreign_listings(self, monkeypatch):
+        from mybroker.config import suggest_ticker_for_name
+
+        quotes = [
+            {"symbol": "AXISBANK.BO", "quoteType": "EQUITY", "exchange": "BSE"},
+            {"symbol": "AXB.IL", "quoteType": "EQUITY", "exchange": "IOB"},  # London GDR
+            {"symbol": "AXISBANK.NS", "quoteType": "EQUITY", "exchange": "NSI"},
+        ]
+        monkeypatch.setattr("yfinance.Search", self._mock_search(quotes))
+
+        assert suggest_ticker_for_name("AXIS BANK LIMITED") == "AXISBANK.NS"
+
+    def test_falls_back_to_bse_when_no_nse_listing(self, monkeypatch):
+        from mybroker.config import suggest_ticker_for_name
+
+        quotes = [{"symbol": "SOMECO.BO", "quoteType": "EQUITY", "exchange": "BSE"}]
+        monkeypatch.setattr("yfinance.Search", self._mock_search(quotes))
+
+        assert suggest_ticker_for_name("Some Co") == "SOMECO.BO"
+
+    def test_returns_none_when_nothing_matches(self, monkeypatch):
+        """The real-world ZOMATO-after-rename-to-ETERNAL case: yfinance's
+        own search can come back empty."""
+        from mybroker.config import suggest_ticker_for_name
+
+        monkeypatch.setattr("yfinance.Search", self._mock_search([]))
+
+        assert suggest_ticker_for_name("ZOMATO") is None
+
+    def test_ignores_non_equity_and_non_indian_results(self, monkeypatch):
+        from mybroker.config import suggest_ticker_for_name
+
+        quotes = [
+            {"symbol": "SOMECO.SA", "quoteType": "EQUITY", "exchange": "SAO"},  # Brazil
+            {"symbol": "SOMECOF", "quoteType": "FUTURE", "exchange": "NSI"},
+        ]
+        monkeypatch.setattr("yfinance.Search", self._mock_search(quotes))
+
+        assert suggest_ticker_for_name("Some Co") is None
+
+    def test_returns_none_on_any_error_rather_than_raising(self, monkeypatch):
+        """A network hiccup or rate limit here must never propagate —
+        this is pure convenience, never a gate."""
+        from mybroker.config import suggest_ticker_for_name
+
+        def _raise(*_a, **_kw):
+            raise RuntimeError("network is down")
+
+        monkeypatch.setattr("yfinance.Search", _raise)
+
+        assert suggest_ticker_for_name("Anything") is None
+
+
+class TestBondExclusionAndNameResolution:
+    def test_bond_and_gold_bond_rows_are_excluded_from_equity(self, tmp_path, fake_tickers):
+        from mybroker.portfolio.importers import extract_positions
+
+        path = tmp_path / "holdings.csv"
+        path.write_text(
+            "Scrip Name,Total Qty,Avg Rate,Holding Value,LTP,Market Value,PL (Rs.),PL%\n"
+            "2.50% JAN29 SERIES X FY 2020-2,4,5104.00,20416.00,13604.17,54416.68,34000.68,6.66\n"
+            "2.50%GOLDBONDS2029SR-IX,1,5000.00,5000.00,13574.78,13574.78,8574.78,1.71\n"
+            "HDFC BANK LTD,74,925.41,68480.19,731.55,54134.70,-14345.64,-15.50\n"
+        )
+
+        kind, positions, warnings = extract_positions(path)
+        assert kind == "equity"
+        assert [p.symbol for p in positions] == ["HDFCBANK"]
+        assert len([w for w in warnings if "bond" in w.lower()]) == 2
+
+    def test_name_variants_resolve_to_the_same_symbol(self, tmp_path, fake_tickers):
+        """'HDFC BANK LTD' and 'HDFC BANK LTD.' are the same company
+        recorded slightly differently — both must resolve to HDFCBANK via
+        tickers.yaml's own `name:` field, not stay as two unmapped symbols."""
+        from mybroker.portfolio.importers import extract_positions
+
+        path = tmp_path / "holdings.csv"
+        path.write_text(
+            "Scrip Name,Total Qty,Avg Rate,Holding Value,LTP,Market Value,PL (Rs.),PL%\n"
+            "HDFC BANK LTD,74,925.41,68480.19,731.55,54134.70,-14345.64,-15.50\n"
+            "HDFC BANK LTD.,4,851.71,3406.85,731.55,2926.20,-480.64,-0.56\n"
+            "TATA STEEL LTD.,500,139.01,69502.74,191.86,95930.00,26425.00,190.09\n"
+        )
+
+        _, positions, warnings = extract_positions(path)
+        assert {p.symbol for p in positions} == {"HDFCBANK", "TATASTEEL"}
+        assert all(p.sector != "Unknown" for p in positions)
+        assert warnings == []  # every row resolved — no "not in tickers.yaml"
+
+    def test_unmatched_name_stays_unresolved_not_guessed(self, tmp_path, fake_tickers):
+        """A name matching no tickers.yaml entry must never be guessed at —
+        same rule symbol_meta() already applies to exact-symbol lookups."""
+        from mybroker.portfolio.importers import extract_positions
+
+        path = tmp_path / "holdings.csv"
+        path.write_text(
+            "Scrip Name,Total Qty,Avg Rate,Holding Value,LTP,Market Value,PL (Rs.),PL%\n"
+            "AXIS BANK LIMITED,39,1331.66,51934.82,1161.30,45290.70,-6644.04,-4.99\n"
+        )
+
+        _, positions, warnings = extract_positions(path)
+        assert positions[0].symbol == "AXIS BANK LIMITED"  # left as the raw name
+        assert positions[0].sector == "Unknown"
+        assert any("not in tickers.yaml" in w for w in warnings)
+
+    def test_ambiguous_name_match_stays_unresolved(self, monkeypatch, tmp_path):
+        """Two tickers.yaml entries with the same normalized name is a
+        pathological config, but must still refuse to guess rather than
+        pick one arbitrarily."""
+        data = {
+            "symbols": {
+                "FOOA": {"name": "Foo Industries Ltd"},
+                "FOOB": {"name": "Foo Industries Ltd."},  # same after normalizing
+            },
+            "indices": {},
+        }
+        monkeypatch.setattr("mybroker.config.load_tickers", lambda: data)
+        from mybroker.portfolio.importers import extract_positions
+
+        path = tmp_path / "holdings.csv"
+        path.write_text(
+            "Scrip Name,Total Qty,Avg Rate,Holding Value,LTP,Market Value,PL (Rs.),PL%\n"
+            "FOO INDUSTRIES LIMITED,10,100.00,1000.00,110.00,1100.00,100.00,10.0\n"
+        )
+
+        _, positions, warnings = extract_positions(path)
+        assert positions[0].sector == "Unknown"
+        assert any("not in tickers.yaml" in w for w in warnings)
+
+
+class TestCrossSourceLotMerging:
+    def test_merges_lots_of_the_same_symbol_across_sources(self, tmp_path, fake_tickers):
+        """The full real scenario: the same stock held across two different
+        brokers (a Zerodha-style root holdings.csv, and a Sharekhan-style
+        statement in the inbox with two name-variant lots) must merge into
+        one combined position for accurate concentration/policy checks."""
+        from mybroker.portfolio.loader import load_portfolio
+
+        inbox = tmp_path / "inbox"
+        inbox.mkdir()
+        (inbox / "sharekhan.csv").write_text(
+            "Scrip Name,Total Qty,Avg Rate,Holding Value,LTP,Market Value,PL (Rs.),PL%\n"
+            "HDFC BANK LTD,74,925.41,68480.19,731.55,54134.70,-14345.64,-15.50\n"
+            "HDFC BANK LTD.,4,851.71,3406.85,731.55,2926.20,-480.64,-0.56\n"
+        )
+        root = tmp_path / "holdings.csv"
+        root.write_text(
+            '"Instrument","Qty.","Avg. cost","LTP","Invested","Cur. val","P&L","Net chg.","Day chg.",""\n'
+            '"HDFCBANK",73,879.08,729,64173.2,53217,-10956.2,-17.07,0,""\n'
+        )
+
+        portfolio = load_portfolio(
+            equity_path=root, mf_path=tmp_path / "no_mf.csv", inbox_dir=inbox,
+        )
+
+        assert len(portfolio.equity) == 1
+        merged = portfolio.equity[0]
+        assert merged.symbol == "HDFCBANK"
+        assert merged.quantity == pytest.approx(73 + 74 + 4)
+        assert merged.current_value == pytest.approx(53217 + 54134.70 + 2926.20)
+        # Weighted average cost, recomputed from the merged totals — not a
+        # plain average of the three lots' own avg_cost figures.
+        assert merged.avg_cost == pytest.approx(merged.invested / merged.quantity)
+
+    def test_unresolved_positions_only_merge_on_exact_raw_name(self, tmp_path, fake_tickers):
+        """Two DIFFERENT unmapped spellings of the same company must NOT be
+        silently merged — that would be guessing they're the same stock
+        without tickers.yaml ever confirming it."""
+        from mybroker.portfolio.importers import extract_positions
+        from mybroker.portfolio.loader import _merge_same_symbol_lots
+
+        path = tmp_path / "holdings.csv"
+        path.write_text(
+            "Scrip Name,Total Qty,Avg Rate,Holding Value,LTP,Market Value,PL (Rs.),PL%\n"
+            "AXIS BANK LIMITED,39,1331.66,51934.82,1161.30,45290.70,-6644.04,-4.99\n"
+            "AXIS BANK LTD,10,1300.00,13000.00,1200.00,12000.00,-1000.00,-7.69\n"
+        )
+
+        _, positions, _ = extract_positions(path)
+        merged = _merge_same_symbol_lots(positions)
+        assert len(merged) == 2  # stayed separate — different raw strings
+
+
+# ── Broker column-name variety ───────────────────────────────────────────────
+class TestColumnNameVariants:
+    """Confirmed real terminology across brokers/DPs — Groww/Upstox call
+    average cost "Average Price" (not "avg cost"/"avg rate"), which the
+    original keyword lists genuinely didn't catch: "average" doesn't
+    contain the substring "avg", so ("avg", "price") never matched it."""
+
+    def test_average_price_is_recognised_as_avg_cost(self, tmp_path, fake_tickers):
+        from mybroker.portfolio.importers import extract_positions
+
+        path = tmp_path / "holdings.csv"
+        path.write_text(
+            "Scrip Name,Qty,Average Price,Invested,Current Value\n"
+            "HDFC BANK LTD,10,1500.00,15000.00,16000.00\n"
+        )
+
+        _, positions, _ = extract_positions(path)
+        assert positions[0].avg_cost == pytest.approx(1500.0)
+
+    @pytest.mark.parametrize("column", ["Buy Price", "Purchase Price"])
+    def test_buy_purchase_price_recognised_as_avg_cost(self, tmp_path, fake_tickers, column):
+        from mybroker.portfolio.importers import extract_positions
+
+        path = tmp_path / "holdings.csv"
+        path.write_text(
+            f"Scrip Name,Qty,{column},Invested,Current Value\n"
+            "HDFC BANK LTD,10,1500.00,15000.00,16000.00\n"
+        )
+
+        _, positions, _ = extract_positions(path)
+        assert positions[0].avg_cost == pytest.approx(1500.0)
+
+    def test_current_price_recognised_as_ltp(self, tmp_path, fake_tickers):
+        from mybroker.portfolio.importers import extract_positions
+
+        path = tmp_path / "holdings.csv"
+        path.write_text(
+            "Scrip Name,Qty,Avg Cost,Current Price,Invested,Current Value\n"
+            "HDFC BANK LTD,10,1500.00,1600.00,15000.00,16000.00\n"
+        )
+
+        _, positions, _ = extract_positions(path)
+        assert positions[0].ltp == pytest.approx(1600.0)
+
+    def test_cost_of_acquisition_recognised_as_invested(self, tmp_path, fake_tickers):
+        from mybroker.portfolio.importers import extract_positions
+
+        path = tmp_path / "holdings.csv"
+        path.write_text(
+            "Scrip Name,Qty,Avg Cost,Cost of Acquisition,Current Value\n"
+            "HDFC BANK LTD,10,1500.00,15000.00,16000.00\n"
+        )
+
+        _, positions, _ = extract_positions(path)
+        assert positions[0].invested == pytest.approx(15000.0)
+
+
+# ── Password-protected PDFs (CAMS/KFintech/NSDL/CDSL CAS statements) ────────
+class TestPasswordProtectedPdf:
+    @pytest.fixture
+    def encrypted_pdf(self, tmp_path):
+        """A minimal real encrypted PDF — pypdf is test-only, never a
+        runtime dependency (pdfplumber does the actual reading)."""
+        pypdf = pytest.importorskip("pypdf")
+
+        path = tmp_path / "statement.pdf"
+        writer = pypdf.PdfWriter()
+        writer.add_blank_page(width=400, height=200)
+        writer.encrypt(user_password="MYPAN1234A", owner_password="MYPAN1234A")
+        with path.open("wb") as fh:
+            writer.write(fh)
+        return path
+
+    def test_no_password_available_raises_actionably(self, encrypted_pdf):
+        from mybroker.portfolio.importers import read_grid
+
+        with pytest.raises(ValueError, match="password"):
+            read_grid(encrypted_pdf)
+
+    def test_sidecar_password_file_opens_it(self, encrypted_pdf):
+        from mybroker.portfolio.importers import read_grid
+
+        (encrypted_pdf.parent / f"{encrypted_pdf.name}.password").write_text("MYPAN1234A")
+
+        read_grid(encrypted_pdf)  # doesn't raise
+
+    def test_env_var_password_opens_it(self, encrypted_pdf, monkeypatch):
+        from mybroker.portfolio.importers import read_grid
+
+        monkeypatch.setenv("FACTFOLIO_PDF_PASSWORD", "MYPAN1234A")
+
+        read_grid(encrypted_pdf)  # doesn't raise
+
+    def test_wrong_password_raises_actionably(self, encrypted_pdf, monkeypatch):
+        from mybroker.portfolio.importers import read_grid
+
+        monkeypatch.setenv("FACTFOLIO_PDF_PASSWORD", "WRONGPASS")
+
+        with pytest.raises(ValueError, match="password"):
+            read_grid(encrypted_pdf)
+
+    def test_password_sidecar_is_never_treated_as_a_holdings_file(self, encrypted_pdf):
+        """The sidecar itself must not be picked up by the inbox scan —
+        .password isn't a supported holdings format."""
+        from mybroker.portfolio.importers import discover_inbox_files
+
+        (encrypted_pdf.parent / f"{encrypted_pdf.name}.password").write_text("MYPAN1234A")
+
+        found = discover_inbox_files(encrypted_pdf.parent)
+        assert found == [encrypted_pdf]
+
+
+# ── "cd into the project first" hint ─────────────────────────────────────────
+# Real-world regression: `factfolio init` ran from ~/Desktop, creating
+# ~/Desktop/factfolio/ — then `factfolio status` ran from ~/Desktop itself
+# (forgetting the `cd` init's own output told you to do), hitting "no
+# holdings"/"no policy" even though the real project, one level down, has
+# both. "run factfolio init" is actively wrong advice there — it already ran.
+class TestCdHint:
+    def test_no_hint_when_nothing_nearby(self, tmp_path, monkeypatch):
+        from mybroker.config import cd_hint_if_project_nearby
+
+        monkeypatch.chdir(tmp_path)
+        assert cd_hint_if_project_nearby() == ""
+
+    def test_hints_when_a_sibling_project_exists(self, tmp_path, monkeypatch):
+        from mybroker.config import cd_hint_if_project_nearby
+
+        nested = tmp_path / "factfolio" / "memory" / "investment_policy.md"
+        nested.parent.mkdir(parents=True)
+        nested.write_text("x")
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(
+            "mybroker.config.POLICY_FILE", tmp_path / "memory" / "investment_policy.md"
+        )
+
+        assert "cd factfolio" in cd_hint_if_project_nearby()
+
+    def test_no_hint_when_already_inside_that_project(self, tmp_path, monkeypatch):
+        """Guard against suggesting `cd factfolio` while already standing
+        inside the very folder it would point at."""
+        from mybroker.config import cd_hint_if_project_nearby
+
+        nested = tmp_path / "factfolio" / "memory" / "investment_policy.md"
+        nested.parent.mkdir(parents=True)
+        nested.write_text("x")
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr("mybroker.config.POLICY_FILE", nested)  # already pointing at it
+
+        assert cd_hint_if_project_nearby() == ""
+
+    def test_missing_equity_error_includes_the_hint(self, tmp_path, monkeypatch):
+        nested = tmp_path / "factfolio" / "memory" / "investment_policy.md"
+        nested.parent.mkdir(parents=True)
+        nested.write_text("x")
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(
+            "mybroker.config.POLICY_FILE", tmp_path / "memory" / "investment_policy.md"
+        )
+
+        with pytest.raises(FileNotFoundError, match="cd factfolio"):
+            load_portfolio(
+                equity_path=tmp_path / "nope.csv",
+                mf_path=tmp_path / "nope_mf.csv",
+                inbox_dir=tmp_path / "empty_inbox",
+            )
+
+    def test_missing_policy_error_includes_the_hint(self, tmp_path, monkeypatch):
+        """policy.py binds POLICY_FILE via its own top-level `from
+        mybroker.config import POLICY_FILE` — an independent name, not a
+        live reference — so both it and config.py's own copy need
+        patching for Policy.load()'s default path and
+        cd_hint_if_project_nearby()'s comparison to agree, same as they
+        would from the same real os.environ-based resolution un-mocked."""
+        from mybroker.portfolio.policy import Policy
+
+        nested = tmp_path / "factfolio" / "memory" / "investment_policy.md"
+        nested.parent.mkdir(parents=True)
+        nested.write_text("x")
+        monkeypatch.chdir(tmp_path)
+        missing = tmp_path / "memory" / "investment_policy.md"
+        monkeypatch.setattr("mybroker.config.POLICY_FILE", missing)
+        monkeypatch.setattr("mybroker.portfolio.policy.POLICY_FILE", missing)
+
+        with pytest.raises(FileNotFoundError, match="cd factfolio"):
+            Policy.load()

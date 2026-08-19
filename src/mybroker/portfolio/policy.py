@@ -19,7 +19,7 @@ from typing import Any
 
 import yaml
 
-from mybroker.config import POLICY_FILE
+from mybroker.config import POLICY_FILE, cd_hint_if_project_nearby
 from mybroker.portfolio.metrics import PortfolioSnapshot
 
 _YAML_BLOCK = re.compile(r"```yaml\s*\n(.*?)\n```", re.DOTALL)
@@ -105,7 +105,8 @@ class Policy:
         if not path.exists():
             raise FileNotFoundError(
                 f"No investment policy at {path}. This file defines the rules "
-                f"every recommendation is measured against — run `factfolio init`."
+                f"every recommendation is measured against — run "
+                f"`factfolio init`.{cd_hint_if_project_nearby()}"
             )
         match = _YAML_BLOCK.search(path.read_text())
         if not match:

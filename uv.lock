@@ -420,11 +420,12 @@ wheels = [
 
 [[package]]
 name = "factfolio"
-version = "0.3.0"
+version = "0.4.0"
 source = { editable = "." }
 dependencies = [
     { name = "beautifulsoup4" },
     { name = "claude-agent-sdk" },
+    { name = "lxml" },
     { name = "mcp" },
     { name = "networkx" },
     { name = "numpy" },
@@ -445,6 +446,7 @@ build = [
     { name = "pyinstaller" },
 ]
 dev = [
+    { name = "pypdf" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "ruff" },
@@ -454,6 +456,7 @@ dev = [
 requires-dist = [
     { name = "beautifulsoup4", specifier = ">=4.15.0" },
     { name = "claude-agent-sdk", specifier = ">=0.1.0" },
+    { name = "lxml", specifier = ">=5.0" },
     { name = "mcp", specifier = ">=1.2" },
     { name = "networkx", specifier = ">=3.4" },
     { name = "numpy", specifier = ">=2.0" },
@@ -462,6 +465,7 @@ requires-dist = [
     { name = "pdfplumber", specifier = ">=0.11.10" },
     { name = "pydantic", specifier = ">=2.9" },
     { name = "pyinstaller", marker = "extra == 'build'", specifier = ">=6.11" },
+    { name = "pypdf", marker = "extra == 'dev'", specifier = ">=5.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.3" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.24" },
     { name = "pyyaml", specifier = ">=6.0" },
@@ -1184,6 +1188,15 @@ wheels = [
 [package.optional-dependencies]
 crypto = [
     { name = "cryptography" },
+]
+
+[[package]]
+name = "pypdf"
+version = "6.16.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/b6/5a/df92d1c1ef8806ca28f20f978ee059894868d93de797a7e2edebe7fe1a43/pypdf-6.16.1.tar.gz", hash = "sha256:c4d1b43ddae921387321cf63936cd16a7743b91d2da92f165c149a195c972ba9", size = 7003737, upload-time = "2026-08-14T12:24:04.531Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/33/a1/724b18d6757ab7253a8fecd3a430eb8d980ed26872ba16651e7b5ddfc63f/pypdf-6.16.1-py3-none-any.whl", hash = "sha256:63fec31c4092ae50b6729beedcb469055b60d20c834bde1c402df241f371f644", size = 382924, upload-time = "2026-08-14T12:24:02.854Z" },
 ]
 
 [[package]]

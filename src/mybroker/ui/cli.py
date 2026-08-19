@@ -8,12 +8,14 @@ them plain terminal I/O or structured data, no GUI.
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from datetime import date
 from pathlib import Path
 from typing import Any
 
 import anyio
+import yaml
 from rich.console import Console
 from rich.table import Table
 
@@ -522,6 +524,96 @@ def _resolve_init_target(cwd: Path) -> Path:
     return _next_available(cwd)
 
 
+def _draft_ticker_entry(symbol: str) -> str:
+    """One new tickers.yaml entry, clearly marked as unverified — see
+    _seed_draft_ticker_entries. `candidates` is a guess `factfolio
+    validate` will empirically confirm or reject, never silently trusted;
+    sector/tier/bucket stay honestly unclassified (`Unknown`/`unknown`)
+    rather than guessed, since nothing in a holdings file says what sector
+    a stock is in."""
+    return (
+        f"  {symbol}:\n"
+        f"    name: {symbol}  # TODO: replace with the real company name\n"
+        f"    candidates: [{symbol}.NS, {symbol}.BO]  # DRAFT — unverified guess\n"
+        f"    sector: Unknown  # TODO\n"
+        f"    tier: unknown  # TODO: large | mid | small\n"
+        f"    bucket: satellite  # TODO: core | satellite\n"
+        f"    notes: >\n"
+        f"      DRAFT — seeded from your holdings at `factfolio init`. Verify the\n"
+        f"      candidates resolve (`factfolio validate`) and fill in\n"
+        f"      sector/tier/bucket before relying on this.\n"
+    )
+
+
+def _insert_ticker_yaml_block(tickers_file: Path, entries_text: str) -> bool:
+    """Insert `entries_text` (one or more already-formatted entries) into
+    the `symbols:` section of `tickers_file`, right after the last real
+    entry and before any blank/comment lines already leading into the
+    next top-level key (`indices:`/`settings:` in the bundled file, EOF
+    otherwise) — never between them. Returns False (and touches nothing)
+    if there's no `symbols:` key to anchor on at all, e.g. a hand-edited
+    file that's drifted too far from the template to guess an insertion
+    point in safely.
+    """
+    text = tickers_file.read_text(encoding="utf-8")
+    lines = text.splitlines(keepends=True)
+    try:
+        symbols_idx = next(i for i, line in enumerate(lines) if line.startswith("symbols:"))
+    except StopIteration:
+        return False
+
+    end = len(lines)
+    for i in range(symbols_idx + 1, len(lines)):
+        if re.match(r"^[A-Za-z_]", lines[i]):
+            end = i
+            break
+    insert_at = end
+    while insert_at > symbols_idx + 1 and (
+        lines[insert_at - 1].strip() == "" or lines[insert_at - 1].lstrip().startswith("#")
+    ):
+        insert_at -= 1
+
+    lines[insert_at:insert_at] = ["\n" + entries_text]
+    tickers_file.write_text("".join(lines), encoding="utf-8")
+    return True
+
+
+def _seed_draft_ticker_entries(tickers_file: Path) -> set[str]:
+    """Append a DRAFT entry for every symbol found in your holdings that
+    isn't mapped in `tickers_file` yet — genuine short-symbol sources only
+    (Zerodha's `Instrument`, a generic `Symbol` column); a source with
+    only a full company name (a demat holdings PDF, say) has no reliable
+    symbol to derive, so those stay on the existing "not in tickers.yaml"
+    warning path instead of being guessed at here.
+
+    Never touches an existing entry, and re-running this is exactly how
+    new holdings get picked up over time — safe to call on every `init`,
+    not just the first. Returns the symbols actually added.
+    """
+    from mybroker.config import HOLDINGS_EQUITY, HOLDINGS_INBOX_DIR
+    from mybroker.portfolio.importers import (
+        discover_equity_symbols_for_drafting,
+        discover_inbox_files,
+    )
+
+    existing = set((yaml.safe_load(tickers_file.read_text()) or {}).get("symbols") or {})
+
+    found: set[str] = set()
+    if HOLDINGS_EQUITY.exists():
+        found |= discover_equity_symbols_for_drafting(HOLDINGS_EQUITY)
+    for file in discover_inbox_files(HOLDINGS_INBOX_DIR):
+        found |= discover_equity_symbols_for_drafting(file)
+
+    new_symbols = sorted(found - existing)
+    if not new_symbols:
+        return set()
+
+    block = "".join(_draft_ticker_entry(s) for s in new_symbols)
+    if not _insert_ticker_yaml_block(tickers_file, block):
+        return set()
+    return set(new_symbols)
+
+
 def cmd_init(_args) -> int:
     """First-run setup: create a dedicated project folder (runtime dirs + a
     starter investment_policy.md) and print exactly how to use it.
@@ -557,8 +649,166 @@ def cmd_init(_args) -> int:
         )
         print(f"{GREEN}✓{RESET} Seeded {config.TICKERS_FILE} from the bundled defaults")
 
+    added = _seed_draft_ticker_entries(config.TICKERS_FILE)
+    if added:
+        plural = "y" if len(added) == 1 else "ies"
+        print(f"{GREEN}✓{RESET} Added {len(added)} draft entr{plural} to "
+              f"{config.TICKERS_FILE} from your holdings — DRAFT, review before "
+              f"relying on them: {', '.join(sorted(added))}")
+        # load_tickers() is cached — anything it already returned this
+        # process is now stale after the write above, and the resolver
+        # steps below need to see these new entries, not miss them.
+        config.load_tickers.cache_clear()
+
+    _suggest_ticker_matches()
+
     _print_getting_started(target, config.TICKERS_FILE)
     return 0
+
+
+_MAX_SUGGESTIONS = 15
+
+
+def _collect_unmapped_holdings() -> list[dict]:
+    """Every full-name holding (name + quantity + avg_cost) across
+    holdings.csv and holdings_inbox/ that can't be auto-drafted — shared
+    by the M7 agent-assisted resolver and its plain-search fallback."""
+    from mybroker.config import HOLDINGS_EQUITY, HOLDINGS_INBOX_DIR
+    from mybroker.portfolio.importers import discover_inbox_files, discover_unmapped_full_names
+
+    sources = []
+    if HOLDINGS_EQUITY.exists():
+        sources.append(HOLDINGS_EQUITY)
+    sources.extend(discover_inbox_files(HOLDINGS_INBOX_DIR))
+
+    holdings: list[dict] = []
+    seen: set[str] = set()
+    for file in sources:
+        for h in discover_unmapped_full_names(file):
+            if h["name"] not in seen:
+                seen.add(h["name"])
+                holdings.append(h)
+    return holdings
+
+
+def _suggest_ticker_matches() -> None:
+    """For every full-company-name holding that can't be auto-drafted (see
+    importers.discover_unmapped_full_names — a Sharekhan-style "Scrip
+    Name" column, say), try the M7 agent-assisted resolver first
+    (agents/ticker_resolver.py) — it reasons about cross-row duplicates
+    and grounds every claim in a real search result, not just a fuzzy
+    top-hit. High-confidence, validated, non-duplicate resolutions get
+    written straight to tickers.yaml; everything else prints the agent's
+    own reasoning for a human to decide.
+
+    Falls back to a single plain yfinance-search suggestion per name (no
+    reasoning, never auto-written) if the agent path fails for any reason
+    — no `claude` login, network, a malformed response — since this is
+    convenience end to end, never a gate that could block `init`.
+    """
+    holdings = _collect_unmapped_holdings()
+    if not holdings:
+        return
+
+    todo = holdings[:_MAX_SUGGESTIONS]
+    skipped = len(holdings) - len(todo)
+
+    try:
+        _resolve_via_agent(todo, skipped)
+    except Exception:
+        _suggest_via_plain_search(todo, skipped)
+
+
+def _resolve_via_agent(todo: list[dict], skipped: int) -> None:
+    from mybroker import config
+    from mybroker.agents.ticker_resolver import resolve_names
+
+    print(f"\n{DIM}Asking an agent to resolve {len(todo)} unmapped holding "
+          f"name(s)…{RESET}")
+    resolved = anyio.run(resolve_names, todo)
+
+    # Don't rely on the agent always flagging a same-symbol duplicate
+    # correctly (the prompt asks for it, but this is the code-level
+    # backstop) — track every key that already existed (from before this
+    # run, e.g. a pre-existing entry — Tata Motors' 2024 demerger means
+    # the bundled defaults already carry TMCV/TMPV, say) separately from
+    # ones this pass writes itself, so a second name resolving to the
+    # same symbol can never clobber either, and the printed reason for
+    # why stays accurate either way.
+    pre_existing_keys: set[str] = set(yaml.safe_load(config.TICKERS_FILE.read_text())["symbols"])
+    written_this_run: set[str] = set()
+    for r in resolved:
+        key = r.symbol.split(".")[0] if r.symbol else None
+        already_present = key in pre_existing_keys or key in written_this_run
+        if r.symbol and r.confidence == "high" and not r.duplicate_of and not already_present:
+            block = _agent_resolved_entry(r)
+            if _insert_ticker_yaml_block(config.TICKERS_FILE, block):
+                written_this_run.add(key)
+                print(f"  {GREEN}✓{RESET} {r.name!r} → {BOLD}{r.symbol}{RESET} "
+                      f"{DIM}— added to tickers.yaml; still review tier/bucket{RESET}")
+                continue
+        if key in written_this_run and r.symbol and not r.duplicate_of:
+            print(f"  {YELLOW}?{RESET} {r.name!r} — {r.symbol} was already added this "
+                  f"run (likely the same holding as another row): {r.reasoning}")
+        elif key in pre_existing_keys and r.symbol and not r.duplicate_of:
+            print(f"  {YELLOW}?{RESET} {r.name!r} — {r.symbol} is already in tickers.yaml "
+                  f"(check it covers this holding too): {r.reasoning}")
+        elif r.duplicate_of:
+            print(f"  {YELLOW}?{RESET} {r.name!r} — looks like the same holding as "
+                  f"{r.duplicate_of!r}: {r.reasoning}")
+        elif r.symbol:
+            print(f"  {YELLOW}?{RESET} {r.name!r} — possible match {BOLD}{r.symbol}{RESET} "
+                  f"({r.confidence} confidence): {r.reasoning}")
+        else:
+            print(f"  {YELLOW}?{RESET} {r.name!r} — "
+                  f"{r.reasoning or 'no confident match found'}")
+
+    if skipped:
+        print(f"  {DIM}…and {skipped} more — re-run init after adding some of "
+              f"these to see the rest.{RESET}")
+
+
+def _agent_resolved_entry(r) -> str:
+    """A higher-quality entry than _draft_ticker_entry: the candidate and
+    sector come from a real search result the resolver's own validation
+    gate already checked (agents/ticker_resolver.py's _validate), not a
+    bare guess — so, unlike a plain DRAFT, only the single verified
+    candidate is listed, never padded out with an unverified .BO/.NS
+    guess alongside it. tier/bucket still can't come from any market-data
+    source, so those stay your own call either way."""
+    return (
+        f"  {r.symbol.split('.')[0]}:\n"
+        f"    name: {r.company_name or r.name}\n"
+        f"    candidates: [{r.symbol}]  # resolved by the init agent — verified, not guessed\n"
+        f"    sector: {r.sector or 'Unknown'}\n"
+        f"    tier: unknown  # TODO: large | mid | small\n"
+        f"    bucket: satellite  # TODO: core | satellite\n"
+        f"    notes: >\n"
+        f"      Resolved by the factfolio init agent from {r.name!r}, high confidence.\n"
+        f"      tier/bucket still need your own judgment either way — nothing\n"
+        f"      external can tell you which bucket a stock belongs in for your\n"
+        f"      own strategy.\n"
+    )
+
+
+def _suggest_via_plain_search(todo: list[dict], skipped: int) -> None:
+    """The fallback when the agent path isn't available or fails: one
+    plain yfinance-search suggestion per name, no reasoning, never
+    auto-written — same behaviour this had before M7."""
+    from mybroker.config import suggest_ticker_for_name
+
+    print(f"\n{DIM}Looking up possible matches for {len(todo) + skipped} unmapped "
+          f"holding name(s) via yfinance…{RESET}")
+    for h in todo:
+        suggestion = suggest_ticker_for_name(h["name"])
+        if suggestion:
+            print(f"  {YELLOW}?{RESET} {h['name']!r} — possible match {BOLD}{suggestion}{RESET} "
+                  f"{DIM}— verify, then add it to tickers.yaml yourself{RESET}")
+        else:
+            print(f"  {YELLOW}?{RESET} {h['name']!r} — no confident match, search manually")
+    if skipped:
+        print(f"  {DIM}…and {skipped} more — re-run init after adding some of "
+              f"these to see the rest.{RESET}")
 
 
 def _print_getting_started(target: Path, tickers_file: Path) -> None:

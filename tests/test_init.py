@@ -20,6 +20,7 @@ Covers:
 from __future__ import annotations
 
 import pytest
+import yaml
 
 from mybroker.portfolio.policy import Policy
 from mybroker.ui.cli import (
@@ -34,8 +35,21 @@ from mybroker.ui.cli import (
 @pytest.fixture(autouse=True)
 def isolated_project(tmp_path, monkeypatch):
     """Run every test from inside an empty tmp_path — never the real
-    project's own directory."""
+    project's own directory. Also blocks real network/agent calls from
+    cmd_init's ticker-resolution steps (see _suggest_ticker_matches) — no
+    test here should depend on, or be slowed or flaked by, live
+    network/Yahoo/claude behavior (this machine may genuinely have a
+    working `claude` login, which would otherwise make the M7 agent path
+    actually run for real inside a unit test). Tests that care about
+    either the agent or plain-search suggestion path override these
+    explicitly."""
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("mybroker.config.suggest_ticker_for_name", lambda name: None)
+
+    async def _no_agent(_holdings):
+        raise RuntimeError("agent path disabled in tests by default")
+
+    monkeypatch.setattr("mybroker.agents.ticker_resolver.resolve_names", _no_agent)
     yield tmp_path
 
 
@@ -184,6 +198,296 @@ def test_does_not_overwrite_an_existing_tickers_yaml(isolated_project):
     cmd_init(None)
 
     assert (project_dir / "tickers.yaml").read_text() == "symbols: {CUSTOM: {}}"
+
+
+# ── Draft tickers.yaml entries seeded from holdings ──────────────────────────
+# Real-world request: rather than seeding tickers.yaml purely from the
+# maintainer's own bundled portfolio, scan the holdings you've actually
+# dropped in and draft entries for whatever's found — genuine short-symbol
+# sources only (see importers.discover_equity_symbols_for_drafting's own
+# docstring for why a full-company-name column can't be drafted safely).
+
+_BASE_TICKERS_YAML = (
+    "symbols:\n"
+    "  EXISTING:\n"
+    "    name: Existing Corp\n"
+    "    candidates: [EXISTING.NS]\n"
+    "    sector: Tech\n"
+    "    tier: large\n"
+    "    bucket: core\n"
+    "\n"
+    "indices:\n"
+    '  NIFTY50: { name: Nifty 50, candidates: ["^NSEI"] }\n'
+)
+
+_HOLDINGS_CSV_HEADER = (
+    '"Instrument","Qty.","Avg. cost","LTP","Invested","Cur. val","P&L",'
+    '"Net chg.","Day chg.",""\n'
+)
+
+
+def _init_project(isolated_project, tickers_yaml_text):
+    """A pre-initialized project folder with specific tickers.yaml content,
+    so cmd_init() reuses it in place rather than creating a fresh nested
+    copy — see _resolve_init_target."""
+    project_dir = isolated_project / "factfolio"
+    (project_dir / "memory").mkdir(parents=True)
+    (project_dir / "memory" / "investment_policy.md").write_text("MY POLICY")
+    (project_dir / "tickers.yaml").write_text(tickers_yaml_text)
+    return project_dir
+
+
+def test_drafts_a_new_symbol_from_root_holdings_csv(isolated_project):
+    project_dir = _init_project(isolated_project, _BASE_TICKERS_YAML)
+    (project_dir / "holdings.csv").write_text(
+        _HOLDINGS_CSV_HEADER + '"NEWSTOCK",10,100.0,110.0,1000.0,1100.0,100.0,10.0,0,""\n'
+    )
+
+    cmd_init(None)
+
+    data = yaml.safe_load((project_dir / "tickers.yaml").read_text())
+    assert data["symbols"]["NEWSTOCK"]["sector"] == "Unknown"
+    assert data["symbols"]["NEWSTOCK"]["candidates"] == ["NEWSTOCK.NS", "NEWSTOCK.BO"]
+    assert "EXISTING" in data["symbols"]  # untouched
+    assert data["indices"]["NIFTY50"]["name"] == "Nifty 50"  # untouched
+
+
+def test_drafts_a_new_symbol_from_holdings_inbox(isolated_project):
+    project_dir = _init_project(isolated_project, _BASE_TICKERS_YAML)
+    (project_dir / "holdings_inbox").mkdir()
+    (project_dir / "holdings_inbox" / "broker.csv").write_text(
+        "Symbol,Qty,Avg Price,Invested,Current Value\nNEWSTOCK,10,100.0,1000.0,1100.0\n"
+    )
+
+    cmd_init(None)
+
+    data = yaml.safe_load((project_dir / "tickers.yaml").read_text())
+    assert "NEWSTOCK" in data["symbols"]
+
+
+def test_does_not_redraft_an_already_mapped_symbol(isolated_project):
+    project_dir = _init_project(isolated_project, _BASE_TICKERS_YAML)
+    (project_dir / "holdings.csv").write_text(
+        _HOLDINGS_CSV_HEADER + '"EXISTING",10,100.0,110.0,1000.0,1100.0,100.0,10.0,0,""\n'
+    )
+    before = (project_dir / "tickers.yaml").read_text()
+
+    cmd_init(None)
+
+    assert (project_dir / "tickers.yaml").read_text() == before  # unchanged
+
+
+def test_does_not_draft_a_full_company_name_column(isolated_project):
+    """Sharekhan-style 'Scrip Name' is a full company name, not a genuine
+    trading symbol — guessing HDFCBANK from "HDFC BANK LTD." is exactly
+    the kind of guess this project refuses to make."""
+    project_dir = _init_project(isolated_project, _BASE_TICKERS_YAML)
+    (project_dir / "holdings_inbox").mkdir()
+    (project_dir / "holdings_inbox" / "sharekhan.csv").write_text(
+        "Scrip Name,Total Qty,Avg Rate,Holding Value,LTP,Market Value,PL (Rs.),PL%\n"
+        "HDFC BANK LTD.,4,851.71,3406.85,731.55,2926.20,-480.64,-0.56\n"
+    )
+
+    cmd_init(None)
+
+    data = yaml.safe_load((project_dir / "tickers.yaml").read_text())
+    assert set(data["symbols"]) == {"EXISTING"}  # nothing drafted
+
+
+def test_plain_fallback_suggests_but_never_writes(
+    isolated_project, monkeypatch, capsys
+):
+    """A full-name-only holding never gets auto-drafted. With the agent
+    path unavailable (isolated_project's default), init should still
+    surface a plain yfinance-search suggestion — never written to
+    tickers.yaml itself."""
+    project_dir = _init_project(isolated_project, _BASE_TICKERS_YAML)
+    (project_dir / "holdings_inbox").mkdir()
+    (project_dir / "holdings_inbox" / "sharekhan.csv").write_text(
+        "Scrip Name,Total Qty,Avg Rate,Holding Value,LTP,Market Value,PL (Rs.),PL%\n"
+        "AXIS BANK LIMITED,39,1331.66,51934.82,1161.30,45290.70,-6644.04,-4.99\n"
+    )
+    monkeypatch.setattr(
+        "mybroker.config.suggest_ticker_for_name",
+        lambda name: "AXISBANK.NS" if "AXIS" in name else None,
+    )
+
+    assert cmd_init(None) == 0
+
+    out = capsys.readouterr().out
+    assert "AXIS BANK LIMITED" in out
+    assert "AXISBANK.NS" in out
+    # Still never auto-written.
+    data = yaml.safe_load((project_dir / "tickers.yaml").read_text())
+    assert set(data["symbols"]) == {"EXISTING"}
+
+
+def test_agent_path_auto_writes_a_high_confidence_resolution(
+    isolated_project, monkeypatch, capsys
+):
+    """A validated, high-confidence, non-duplicate agent resolution gets
+    written straight to tickers.yaml — a materially better entry than the
+    plain fallback's bare guess, since it carries a real sector from the
+    same evidence the agent was validated against."""
+    from mybroker.agents.ticker_resolver import ResolvedName
+
+    project_dir = _init_project(isolated_project, _BASE_TICKERS_YAML)
+    (project_dir / "holdings_inbox").mkdir()
+    (project_dir / "holdings_inbox" / "sharekhan.csv").write_text(
+        "Scrip Name,Total Qty,Avg Rate,Holding Value,LTP,Market Value,PL (Rs.),PL%\n"
+        "AXIS BANK LIMITED,39,1331.66,51934.82,1161.30,45290.70,-6644.04,-4.99\n"
+    )
+
+    async def _fake_resolve(holdings):
+        return [ResolvedName(
+            name="AXIS BANK LIMITED", symbol="AXISBANK.NS", confidence="high",
+            reasoning="Exact NSE match.", sector="Financial Services",
+            company_name="Axis Bank Limited",
+        )]
+
+    monkeypatch.setattr("mybroker.agents.ticker_resolver.resolve_names", _fake_resolve)
+
+    cmd_init(None)
+
+    out = capsys.readouterr().out
+    assert "AXISBANK.NS" in out
+    data = yaml.safe_load((project_dir / "tickers.yaml").read_text())
+    assert "AXISBANK" in data["symbols"]
+    assert data["symbols"]["AXISBANK"]["sector"] == "Financial Services"
+    assert data["symbols"]["AXISBANK"]["candidates"] == ["AXISBANK.NS"]
+    assert data["symbols"]["AXISBANK"]["tier"] == "unknown"  # still your own call
+
+
+def test_agent_path_does_not_write_medium_or_low_confidence(
+    isolated_project, monkeypatch, capsys
+):
+    from mybroker.agents.ticker_resolver import ResolvedName
+
+    project_dir = _init_project(isolated_project, _BASE_TICKERS_YAML)
+    (project_dir / "holdings_inbox").mkdir()
+    (project_dir / "holdings_inbox" / "sharekhan.csv").write_text(
+        "Scrip Name,Total Qty,Avg Rate,Holding Value,LTP,Market Value,PL (Rs.),PL%\n"
+        "SOME COMPANY LTD,10,100,1000,110,1100,100,10\n"
+    )
+
+    async def _fake_resolve(holdings):
+        return [ResolvedName(
+            name="SOME COMPANY LTD", symbol="SOMECO.BO", confidence="medium",
+            reasoning="Only a BSE listing found, some ambiguity.",
+        )]
+
+    monkeypatch.setattr("mybroker.agents.ticker_resolver.resolve_names", _fake_resolve)
+
+    cmd_init(None)
+
+    out = capsys.readouterr().out
+    assert "medium confidence" in out
+    data = yaml.safe_load((project_dir / "tickers.yaml").read_text())
+    assert set(data["symbols"]) == {"EXISTING"}
+
+
+def test_agent_path_does_not_write_a_flagged_duplicate(
+    isolated_project, monkeypatch, capsys
+):
+    """The NTPC LIMITED / NTPC LTD real-world case: the agent flags the
+    second as the same holding as the first — must not get its own
+    tickers.yaml entry."""
+    from mybroker.agents.ticker_resolver import ResolvedName
+
+    project_dir = _init_project(isolated_project, _BASE_TICKERS_YAML)
+    (project_dir / "holdings_inbox").mkdir()
+    (project_dir / "holdings_inbox" / "sharekhan.csv").write_text(
+        "Scrip Name,Total Qty,Avg Rate,Holding Value,LTP,Market Value,PL (Rs.),PL%\n"
+        "NTPC LIMITED,50,356.94,17847.11,370.65,18532.50,685.50,1.92\n"
+        "NTPC LTD,50,376.04,18802.21,370.65,18532.50,-269.50,-0.72\n"
+    )
+
+    async def _fake_resolve(holdings):
+        return [
+            ResolvedName(name="NTPC LIMITED", symbol="NTPC.NS", confidence="high",
+                         reasoning="Clear match."),
+            ResolvedName(name="NTPC LTD", symbol="NTPC.NS", confidence="high",
+                         reasoning="Same holding as NTPC LIMITED — identical quantity.",
+                         duplicate_of="NTPC LIMITED"),
+        ]
+
+    monkeypatch.setattr("mybroker.agents.ticker_resolver.resolve_names", _fake_resolve)
+
+    cmd_init(None)
+
+    data = yaml.safe_load((project_dir / "tickers.yaml").read_text())
+    assert list(data["symbols"]).count("NTPC") == 1
+    out = capsys.readouterr().out
+    assert "same holding as" in out
+
+
+def test_agent_path_never_double_writes_the_same_symbol_even_if_unflagged(
+    isolated_project, monkeypatch, capsys
+):
+    """Code-level backstop: even if the agent fails to set duplicate_of
+    itself, two names resolving to the same symbol must never both get
+    written — the second becomes a review item instead of silently
+    clobbering the first entry."""
+    from mybroker.agents.ticker_resolver import ResolvedName
+
+    project_dir = _init_project(isolated_project, _BASE_TICKERS_YAML)
+    (project_dir / "holdings_inbox").mkdir()
+    (project_dir / "holdings_inbox" / "sharekhan.csv").write_text(
+        "Scrip Name,Total Qty,Avg Rate,Holding Value,LTP,Market Value,PL (Rs.),PL%\n"
+        "NTPC LIMITED,50,356.94,17847.11,370.65,18532.50,685.50,1.92\n"
+        "NTPC LTD,50,376.04,18802.21,370.65,18532.50,-269.50,-0.72\n"
+    )
+
+    async def _fake_resolve(holdings):
+        return [
+            ResolvedName(name="NTPC LIMITED", symbol="NTPC.NS", confidence="high",
+                         reasoning="Clear match."),
+            ResolvedName(name="NTPC LTD", symbol="NTPC.NS", confidence="high",
+                         reasoning="Also looks like a clear match."),  # not flagged
+        ]
+
+    monkeypatch.setattr("mybroker.agents.ticker_resolver.resolve_names", _fake_resolve)
+
+    cmd_init(None)
+
+    data = yaml.safe_load((project_dir / "tickers.yaml").read_text())
+    assert list(data["symbols"]).count("NTPC") == 1
+
+
+def test_rerun_drafts_newly_added_holdings_only(isolated_project):
+    project_dir = _init_project(isolated_project, _BASE_TICKERS_YAML)
+    (project_dir / "holdings.csv").write_text(
+        _HOLDINGS_CSV_HEADER + '"FIRSTSTOCK",10,100.0,110.0,1000.0,1100.0,100.0,10.0,0,""\n'
+    )
+    cmd_init(None)  # drafts FIRSTSTOCK
+
+    (project_dir / "holdings.csv").write_text(
+        _HOLDINGS_CSV_HEADER
+        + '"FIRSTSTOCK",10,100.0,110.0,1000.0,1100.0,100.0,10.0,0,""\n'
+        + '"SECONDSTOCK",5,200.0,210.0,1000.0,1050.0,50.0,5.0,0,""\n'
+    )
+    cmd_init(None)  # should draft SECONDSTOCK only, not re-add FIRSTSTOCK
+
+    text = (project_dir / "tickers.yaml").read_text()
+    data = yaml.safe_load(text)
+    assert {"EXISTING", "FIRSTSTOCK", "SECONDSTOCK"} <= set(data["symbols"])
+    assert text.count("FIRSTSTOCK:") == 1
+
+
+def test_yaml_stays_valid_after_multiple_drafts_in_one_run(isolated_project):
+    project_dir = _init_project(isolated_project, _BASE_TICKERS_YAML)
+    (project_dir / "holdings.csv").write_text(
+        _HOLDINGS_CSV_HEADER
+        + '"AAA",1,1,1,1,1,0,0,0,""\n'
+        + '"BBB",1,1,1,1,1,0,0,0,""\n'
+        + '"CCC",1,1,1,1,1,0,0,0,""\n'
+    )
+
+    cmd_init(None)
+
+    data = yaml.safe_load((project_dir / "tickers.yaml").read_text())
+    assert {"AAA", "BBB", "CCC"} <= set(data["symbols"])
+    assert "NIFTY50" in data["indices"]  # still parses, still intact
 
 
 # ── Policy interview ─────────────────────────────────────────────────────────
