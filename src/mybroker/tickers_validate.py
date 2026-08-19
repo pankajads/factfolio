@@ -25,7 +25,17 @@ from datetime import UTC, datetime
 
 import yfinance as yf
 
-from mybroker.config import RESOLVED_TICKERS, TICKERS_FILE, ensure_dirs, load_tickers
+from mybroker.config import (
+    DEFAULT_TICKERS_FILE,
+    HOLDINGS_EQUITY,
+    HOLDINGS_INBOX_DIR,
+    RESOLVED_TICKERS,
+    TICKERS_FILE,
+    cd_hint_if_project_nearby,
+    ensure_dirs,
+    load_tickers,
+)
+from mybroker.portfolio.ticker_seeding import holdings_present, seed_draft_ticker_entries
 
 GREEN, RED, YELLOW, DIM, RESET = "\033[32m", "\033[31m", "\033[33m", "\033[2m", "\033[0m"
 OK, FAIL, WARN = f"{GREEN}✓{RESET}", f"{RED}✗{RESET}", f"{YELLOW}!{RESET}"
@@ -105,9 +115,74 @@ def resolve_group(group: dict, kind: str, min_history: int) -> tuple[dict, list[
     return resolved, failures
 
 
+def _no_holdings_message() -> str:
+    """Nothing to validate at all — no tickers.yaml, and nothing in
+    holdings.csv/holdings_inbox/ to draft one from either. Printed instead
+    of the old behaviour: silently falling back to the bundled scaffold and
+    probing yfinance for placeholder tickers that were never real, which
+    just produced a wall of confusing 404s."""
+    return (
+        f"\n{FAIL} No holdings found, and no {TICKERS_FILE} yet.\n\n"
+        f"  Drop a broker export (csv/xls/xlsx/pdf/txt, equity or mutual "
+        f"fund, any filename)\n  into {HOLDINGS_INBOX_DIR}/, or save one as "
+        f"{HOLDINGS_EQUITY}, then run\n  `factfolio validate` again — it'll "
+        f"build tickers.yaml from what it finds."
+        f"{cd_hint_if_project_nearby()}\n"
+    )
+
+
+def _nothing_mapped_message() -> str:
+    """tickers.yaml exists but maps zero symbols — e.g. every holding found
+    was a full-company-name column (see
+    ticker_seeding.seed_draft_ticker_entries's own docstring) that this
+    deterministic path refuses to guess a symbol for."""
+    return (
+        f"\n{WARN} {TICKERS_FILE} has no symbols mapped yet — nothing to "
+        f"validate.\n\n"
+        f"  Add entries yourself, or run `factfolio init` for AI-assisted "
+        f"resolution of\n  holdings that only carry a full company name "
+        f"(a demat PDF, say).\n"
+    )
+
+
 def main() -> int:
+    from mybroker.logging_setup import get_logger
+
+    logger = get_logger(__name__)
     ensure_dirs()
+
+    if not TICKERS_FILE.exists():
+        if not holdings_present():
+            logger.warning("validate: no tickers.yaml and no holdings found")
+            print(_no_holdings_message())
+            return 1
+        # Holdings exist but tickers.yaml doesn't — seed one from the
+        # bundled scaffold (real indices/settings, no fake sample
+        # equities) and draft real entries straight from those holdings
+        # below. Deterministic, no network beyond the resolution that
+        # follows, no LLM.
+        print(f"\n{DIM}No {TICKERS_FILE} yet — building one from your "
+              f"holdings…{RESET}")
+        TICKERS_FILE.write_text(
+            DEFAULT_TICKERS_FILE.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+
+    # Safe (and cheap) to do on every run, not just the first — this is how
+    # a newly-added holding gets picked up without a separate `init` step.
+    added = seed_draft_ticker_entries(TICKERS_FILE)
+    if added:
+        load_tickers.cache_clear()
+        plural = "y" if len(added) == 1 else "ies"
+        print(f"{GREEN}✓{RESET} Drafted {len(added)} entr{plural} into "
+              f"{TICKERS_FILE} from your holdings — DRAFT, review before "
+              f"relying on them: {', '.join(sorted(added))}\n")
+
     cfg = load_tickers()
+    if not cfg.get("symbols"):
+        logger.warning("validate: tickers.yaml has no symbols mapped — nothing to validate")
+        print(_nothing_mapped_message())
+        return 1
+
     min_history = cfg.get("settings", {}).get("min_history_days", 60)
 
     print(f"\n{DIM}Resolving tickers via yfinance "
@@ -133,14 +208,18 @@ def main() -> int:
 
     print(f"\n{DIM}{'─' * 68}{RESET}")
     print(f"Resolved {total - len(failures)}/{total}   →  {RESOLVED_TICKERS.name}")
+    logger.info("validate: resolved %d/%d (%d failure(s), %d short-history)",
+                total - len(failures), total, len(failures), len(short))
 
     if short:
         print(f"\n{WARN} Short history (excluded from correlation maths):")
         for k in short:
             v = {**sym_resolved, **idx_resolved}[k]
             print(f"    {k} — {v['history_days']}d")
+            logger.warning("validate: %s — insufficient history (%dd)", k, v["history_days"])
 
     if failures:
+        logger.error("validate: unresolved: %s", ", ".join(failures))
         print(f"\n{FAIL} UNRESOLVED: {', '.join(failures)}")
         print(f"  {DIM}Add working candidates to {TICKERS_FILE}{RESET}\n")
         return 1

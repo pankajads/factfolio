@@ -498,6 +498,26 @@ class TestDraftSymbolDiscovery:
 
         assert discover_equity_symbols_for_drafting(path) == set()
 
+    def test_skips_a_column_whose_header_says_symbol_but_data_is_full_names(
+        self, tmp_path
+    ):
+        """Real-world case: a broker PDF's table extraction mislabelled/
+        misaligned its own columns — the header keyword-matches as
+        "symbol" ('Scrip Code'), but the actual extracted data in that
+        column is full company names, not codes. Trusting the header text
+        alone here would draft garbage; must key off what the data looks
+        like instead (see _looks_like_a_symbol_column)."""
+        from mybroker.portfolio.importers import discover_equity_symbols_for_drafting
+
+        path = tmp_path / "transactions.csv"
+        path.write_text(
+            "CustomerId,Scrip Code,Stock Name,Quantity,Avg Buy Price\n"
+            "2448297,AXIS BANK LIMITED,AXISBANK,39,1331.66\n"
+            "2448297,NTPC LIMITED,NTPC,100,366.49\n"
+        )
+
+        assert discover_equity_symbols_for_drafting(path) == set()
+
 
 class TestUnmappedNameDiscovery:
     """discover_unmapped_full_names — the mirror image of
@@ -566,6 +586,24 @@ class TestUnmappedNameDiscovery:
         )
 
         assert len(discover_unmapped_full_names(path)) == 1
+
+    def test_surfaces_names_from_a_column_mislabelled_as_symbol(self, tmp_path):
+        """The exact mirror of TestDraftSymbolDiscovery's swapped-column
+        case: a header that keyword-matches as "symbol" ('Scrip Code')
+        whose actual data is full company names must still reach the AI
+        resolver — the old header-text-only check made both discovery
+        functions give up here, so these holdings were invisible to
+        `factfolio init` entirely, not just left undrafted."""
+        from mybroker.portfolio.importers import discover_unmapped_full_names
+
+        path = tmp_path / "transactions.csv"
+        path.write_text(
+            "CustomerId,Scrip Code,Stock Name,Quantity,Avg Buy Price\n"
+            "2448297,AXIS BANK LIMITED,AXISBANK,39,1331.66\n"
+        )
+
+        holdings = discover_unmapped_full_names(path)
+        assert [h["name"] for h in holdings] == ["AXIS BANK LIMITED"]
 
 
 class TestSuggestTickerForName:
@@ -687,6 +725,8 @@ class TestBondExclusionAndNameResolution:
         assert positions[0].symbol == "AXIS BANK LIMITED"  # left as the raw name
         assert positions[0].sector == "Unknown"
         assert any("not in tickers.yaml" in w for w in warnings)
+        # Not just a bare fact — says what to actually do about it.
+        assert any("factfolio init" in w for w in warnings)
 
     def test_ambiguous_name_match_stays_unresolved(self, monkeypatch, tmp_path):
         """Two tickers.yaml entries with the same normalized name is a
@@ -821,6 +861,35 @@ class TestColumnNameVariants:
 
         _, positions, _ = extract_positions(path)
         assert positions[0].invested == pytest.approx(15000.0)
+
+
+# ── PDF cell text cleanup ────────────────────────────────────────────────────
+class TestCleanPdfCell:
+    """_clean_pdf_cell — pdfplumber wraps long cell text across internal
+    lines (a narrow 'Stock Name' column, say), which used to reach every
+    downstream warning/log/name as literal embedded newlines: "AXIS
+    BANK\\nLIMITED" printed as a garbled multi-line mess in the terminal."""
+
+    def test_collapses_embedded_newlines_to_single_spaces(self):
+        from mybroker.portfolio.importers import _clean_pdf_cell
+
+        assert _clean_pdf_cell("AXIS BANK\nLIMITED") == "AXIS BANK LIMITED"
+        assert _clean_pdf_cell("TATA\nSTEEL\nLIMITED") == "TATA STEEL LIMITED"
+
+    def test_none_becomes_empty_string(self):
+        from mybroker.portfolio.importers import _clean_pdf_cell
+
+        assert _clean_pdf_cell(None) == ""
+
+    def test_ordinary_cell_is_unchanged(self):
+        from mybroker.portfolio.importers import _clean_pdf_cell
+
+        assert _clean_pdf_cell("HDFCBANK") == "HDFCBANK"
+
+    def test_leading_and_trailing_whitespace_still_stripped(self):
+        from mybroker.portfolio.importers import _clean_pdf_cell
+
+        assert _clean_pdf_cell("  NTPC LTD  \n") == "NTPC LTD"
 
 
 # ── Password-protected PDFs (CAMS/KFintech/NSDL/CDSL CAS statements) ────────

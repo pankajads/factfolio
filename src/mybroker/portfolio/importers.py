@@ -223,13 +223,28 @@ def _open_pdf(path: Path):
             ) from exc2
 
 
+def _clean_pdf_cell(cell: str | None) -> str:
+    """pdfplumber wraps long cell text across internal lines using literal
+    newlines (a narrow "Stock Name"/"Scrip Name" column, say) — fine as a
+    rendering detail, but left as-is it turns a one-line company name like
+    "AXIS BANK LIMITED" into "AXIS BANK\nLIMITED", which then prints as a
+    garbled multi-line mess in every warning, log line, and printed
+    position from here on. Collapsing ALL internal whitespace (not just
+    leading/trailing, which `.strip()` alone handles) to single spaces
+    fixes the display without changing what any of it means —
+    _normalize_company_name's own whitespace-tolerant `.split()` already
+    treated a wrapped and unwrapped cell identically either way.
+    """
+    return " ".join((cell or "").split())
+
+
 def _read_pdf_grid(path: Path) -> Grid:
     rows: Grid = []
     with _open_pdf(path) as pdf:
         for page in pdf.pages:
             for table in page.extract_tables() or []:
                 for row in table:
-                    rows.append([(c or "").strip() for c in row])
+                    rows.append([_clean_pdf_cell(c) for c in row])
     return rows
 
 
@@ -482,52 +497,111 @@ def extract_positions(
 _CLEAN_SYMBOL = re.compile(r"^[A-Z0-9&\-]+$")
 
 
+def _looks_like_a_symbol_column(grid: Grid, header_row: int, col: int) -> bool:
+    """True if most non-blank values in `col`, across this table's data
+    rows, look like a genuine short trading symbol ('HDFCBANK') rather
+    than a full company name ('HDFC Bank Limited') — or, just as
+    importantly, rather than a *broken* one: pdfplumber's table extraction
+    can wrap a header labelled "SKScripCode" over a narrow column whose
+    actual data is full company names (a column-alignment quirk on that
+    specific PDF, not a labelling choice), and the header text alone can't
+    tell that apart from a genuine code column. This looks at what the
+    data actually IS instead of trusting what the header claims — both
+    discover_equity_symbols_for_drafting and discover_unmapped_full_names
+    key off this rather than the header's own "name"/"symbol" wording, so
+    they agree on which case they're in rather than each guessing
+    separately and potentially both giving up. Tolerates a stray odd row
+    rather than requiring every one to match.
+    """
+    values = [_cell(r, col).strip().upper() for r in _data_rows(grid, header_row)]
+    values = [v for v in values if v and not _looks_like_a_bond(v)]
+    if not values:
+        return False
+    clean = sum(1 for v in values if _CLEAN_SYMBOL.match(v))
+    return clean / len(values) >= 0.8
+
+
 def discover_equity_symbols_for_drafting(path: Path) -> set[str]:
     """Every symbol in `path` that looks like a genuine short trading
     symbol — used to seed DRAFT tickers.yaml entries at `factfolio init`,
     never to build real positions (see extract_positions for that).
 
     Deliberately narrower than extract_positions: only equity rows whose
-    symbol column header doesn't itself say "name" (Zerodha's
-    "Instrument", a generic "Symbol"/"Trading Symbol") qualify — a column
-    like Sharekhan's "Scrip Name" holds a full company name, and there's
-    no reliable way to derive the real trading symbol from that text
-    alone. That's exactly the kind of guess this project refuses to make,
-    so those rows are left to the existing "not in tickers.yaml" warning
+    symbol column DATA actually looks like short trading symbols (see
+    _looks_like_a_symbol_column) qualify — a column like Sharekhan's
+    "Scrip Name" holds a full company name, and there's no reliable way to
+    derive the real trading symbol from that text alone. That's exactly
+    the kind of guess this project refuses to make, so those rows are left
+    to discover_unmapped_full_names / the "not in tickers.yaml" warning
     instead of being drafted.
 
-    Best-effort and silent on any failure — a malformed or unsupported
-    file here must never block `init`, only `validate`/`status` actually
-    enforce correctness.
+    Best-effort and silent (in the sense of never raising or blocking
+    `init`/`validate`) on any failure — but every outcome, including "found
+    nothing to draft", is logged with a reason (see logging_setup.py):
+    silent-and-*unexplained* is what turned "this xls has mutual funds in
+    it, not equity" into a support request that looked like a missed file.
     """
+    from mybroker.logging_setup import get_logger
+
+    logger = get_logger(__name__)
+
     try:
         grid = read_grid(path)
-    except Exception:
+    except Exception as exc:
+        logger.warning("ticker_drafting: %s: couldn't read — %s: %s",
+                        path.name, type(exc).__name__, exc)
         return set()
 
+    saw_mf = False
     for i, row in enumerate(grid):
         loose = [_loose_norm(c) for c in row]
-        if _classify_row(loose) != "equity":
+        classified = _classify_row(loose)
+        if classified != "equity":
+            # Unlike extract_positions, this keeps scanning past a
+            # non-equity (or unclassified) row rather than stopping at the
+            # first one — a file can have other sections before/after its
+            # real equity header. Just remember an mf hit for the "found
+            # nothing" log message below, in case that's all there ever was.
+            saw_mf = saw_mf or classified == "mf"
             continue
+
         idx = _resolve_columns(loose, _EQUITY_COL_KEYWORDS)
         sym_col = idx.get("symbol")
-        if sym_col is None or "name" in loose[sym_col]:
-            return set()  # a full-name column, not a genuine symbol — skip
+        if sym_col is None or not _looks_like_a_symbol_column(grid, i, sym_col):
+            logger.info("ticker_drafting: %s: equity header found, but the "
+                        "symbol column's data doesn't look like genuine "
+                        "trading symbols (full company names, e.g. 'Scrip "
+                        "Name' — or a header/data column mismatch in this "
+                        "file's own table extraction) — can't auto-draft; "
+                        "needs `factfolio init`'s AI-assisted resolver or a "
+                        "manual tickers.yaml entry", path.name)
+            return set()  # not a genuine symbol column — skip
 
         symbols: set[str] = set()
         for data_row in _data_rows(grid, i):
             raw = _cell(data_row, sym_col).strip().upper()
             if raw and not _looks_like_a_bond(raw) and _CLEAN_SYMBOL.match(raw):
                 symbols.add(raw)
+        logger.info("ticker_drafting: %s: %d candidate symbol(s) found: %s",
+                    path.name, len(symbols), ", ".join(sorted(symbols)) or "(none)")
         return symbols
 
+    if saw_mf:
+        logger.info("ticker_drafting: %s: classified as mutual-fund, not "
+                    "equity — nothing to draft", path.name)
+    else:
+        logger.info("ticker_drafting: %s: no equity or mutual-fund header "
+                    "row found at all — nothing to draft", path.name)
     return set()
 
 
 def discover_unmapped_full_names(path: Path) -> list[dict]:
     """The mirror image of discover_equity_symbols_for_drafting: every
-    full-company-name holding in `path` — a source like Sharekhan's "Scrip
-    Name" column, where the header itself says "name" — that isn't already
+    full-company-name-ish holding in `path` — a source like Sharekhan's
+    "Scrip Name" column whose DATA doesn't look like genuine trading
+    symbols (see _looks_like_a_symbol_column; not just a header that
+    literally says "name" — a mislabelled/misaligned column with the same
+    problem needs this exact same fallback) — that isn't already
     resolvable against an existing tickers.yaml entry (see
     resolve_symbol_by_name). These can never be auto-drafted (see that
     function's own docstring for why), but `factfolio init`'s
@@ -555,7 +629,7 @@ def discover_unmapped_full_names(path: Path) -> list[dict]:
             continue
         idx = _resolve_columns(loose, _EQUITY_COL_KEYWORDS)
         sym_col = idx.get("symbol")
-        if sym_col is None or "name" not in loose[sym_col]:
+        if sym_col is None or _looks_like_a_symbol_column(grid, i, sym_col):
             return []  # a genuine symbol column — discover_equity_symbols_for_drafting's job
 
         holdings: list[dict] = []

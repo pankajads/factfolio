@@ -117,7 +117,9 @@ def _resolve_position(pos: EquityPosition, *, source: str = "") -> str | None:
         if resolved is None:
             return (
                 f"{prefix}{pos.symbol} is not in tickers.yaml — no market data, "
-                f"sector, or policy classification will be available for it."
+                f"sector, or policy classification will be available for it. "
+                f"Run `factfolio init` to try automatic resolution, or add it "
+                f"to tickers.yaml yourself."
             )
         pos.symbol = resolved
         meta = symbol_meta(resolved)
@@ -425,14 +427,29 @@ def load_portfolio(
     warnings.extend(mf_warn)
 
     if include_inbox:
+        from mybroker.logging_setup import get_logger
         from mybroker.portfolio.importers import discover_inbox_files, extract_positions
 
-        for file in discover_inbox_files(inbox_dir):
+        logger = get_logger(__name__)
+        inbox_files = discover_inbox_files(inbox_dir)
+        logger.info("holdings_inbox: %d file(s) found: %s", len(inbox_files),
+                     ", ".join(f.name for f in inbox_files) or "(none)")
+
+        for file in inbox_files:
             try:
                 kind, positions, file_warnings = extract_positions(file)
             except ValueError as exc:
+                # Never silent: this is exactly the "couldn't read/pick up
+                # this file" failure mode, and previously left no trace
+                # anywhere once it scrolled off the terminal.
+                logger.error("holdings_inbox: %s: could not parse — %s", file.name, exc)
                 warnings.append(str(exc))
                 continue
+
+            logger.info("holdings_inbox: %s: parsed as %s, %d position(s), "
+                        "%d warning(s)", file.name, kind, len(positions), len(file_warnings))
+            for w in file_warnings:
+                logger.warning("holdings_inbox: %s", w)
 
             warnings.extend(file_warnings)
             if kind == "equity":
