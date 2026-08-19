@@ -84,9 +84,17 @@ class TestTickerResolution:
             p.resolve("NOPE")
         assert ".NS" in str(exc.value)
 
-    @pytest.mark.parametrize("symbol", ["ETERNAL", "HEXT", "TMCV", "TMPV"])
+    @pytest.mark.parametrize("symbol", ["SAMPLERENAME", "SAMPLESPLIT-A", "SAMPLESPLIT-B"])
     def test_renamed_and_demerged_symbols_resolve(self, symbol):
-        """These are exactly the symbols a naive .NS guess gets wrong."""
+        """The bundled tickers.yaml's own rename/demerger examples — these
+        are exactly the shape of symbol a naive .NS guess gets wrong.
+        Real-world regression: this test previously hardcoded the
+        maintainer's actual portfolio symbols (ETERNAL/HEXT/TMCV/TMPV),
+        which only ever worked locally by masking through a stale
+        .cache/resolved_tickers.json — it silently broke in CI the moment
+        the bundled file's example data changed. Pointing this at the
+        bundled file's own illustrative entries instead means it can never
+        depend on anyone's personal tickers.yaml again."""
         assert YFinanceProvider().resolve(symbol).endswith((".NS", ".BO"))
 
 
