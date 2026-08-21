@@ -686,8 +686,13 @@ async def compute_overlap(args: dict) -> dict:
 @tool(
     "compute_tax_impact",
     "Tax cost of selling. Pass a list of sales, each with symbol, quantity, "
-    "sale_price, avg_cost and optionally purchase_date (YYYY-MM-DD). If "
-    "purchase_date is omitted, a TENTATIVE date from `mybroker estimate-dates` "
+    "sale_price, avg_cost and optionally purchase_date (YYYY-MM-DD). "
+    "quantity and avg_cost MUST come from the real position — call "
+    "get_portfolio_snapshot first and use its figures — never estimated, "
+    "guessed, or backed into from a price move or drawdown percentage: this "
+    "tool computes exactly on the numbers it's given, so a wrong input "
+    "produces a wrong-but-confident-looking tax figure. If purchase_date is "
+    "omitted, a TENTATIVE date from `factfolio estimate-dates` "
     "is used when one exists for that symbol (memory/estimated_purchase_"
     "dates.json) — flagged as estimated in the response, never silently "
     "treated as verified — otherwise the purchase date is unknown and the "

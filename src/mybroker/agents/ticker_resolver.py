@@ -55,16 +55,51 @@ never a symbol you already "know" or believe is likely without calling it.
 
 ## The one rule that matters
 
-Every `symbol` you return for a name MUST be one of the candidates THAT
-name's own search_ticker_by_name call returned. Anything else is rejected in
-code afterward regardless of how confident you sound — so there is no reward
-for guessing when the search comes back thin or empty. Say so honestly
-instead (confidence "low", symbol null).
+Every `symbol` you return for a name MUST be one of the candidates from a
+search_ticker_by_name call made with `for_holding` set to that exact name.
+Anything else is rejected in code afterward regardless of how confident you
+sound — so there is no reward for guessing when the search comes back thin or
+empty. Say so honestly instead (confidence "low", symbol null).
+
+## Read the whole row yourself — do not stop at candidate_symbol
+
+Every holding carries `row_data`: every column from its source file, raw,
+under its own real header label. Read it. A source file's full-name column
+is frequently a PDF-mangled mess ("HINDUSTA N COPPER LTD" for "Hindustan
+Copper Ltd" — a stray mid-word space from narrow-column text wrapping) that
+a plain name search will fail on — but broker/DP exports routinely carry the
+actual trading symbol, an ISIN, or a scrip code in some OTHER column, under
+a header that has nothing to do with "symbol" or "name". Use your own
+judgement on `row_data` the way you would if a person handed you the
+statement: which value, if any, looks like a real short trading code rather
+than an account/customer ID, a quantity, a price, or a Y/N flag? You are
+reading for understanding here, not pattern-matching a fixed list of
+column-name keywords — that's the whole point of giving you the row instead
+of a single pre-picked field.
+
+Some holdings ALSO carry a `candidate_symbol` field — the same idea, but
+already picked out by a cheap, deliberately narrow, no-judgement heuristic
+before you ever saw the row. Treat it as one more thing to verify, not a
+shortcut and not the only thing worth searching: it is exactly as likely to
+be wrong or absent as it is to be right, since it's blind to anything that
+heuristic wasn't built to recognise. If you spot a BETTER candidate in
+row_data yourself, search that instead.
+
+Whatever you decide is worth trying — candidate_symbol, something else you
+noticed in row_data, or the name itself — still go through
+search_ticker_by_name and still only trust what it actually returns. Seeing
+a promising value is a reason to search it, never a reason to skip
+searching.
 
 ## What to do
 
-1. Call search_ticker_by_name once per name you're given (not once for the
-   whole batch).
+1. Read `row_data` first and decide what's actually worth searching for
+   this holding — candidate_symbol, something else you notice in row_data,
+   or the name itself. Call search_ticker_by_name once per name you're
+   given (not once for the whole batch) — `for_holding` is always that
+   exact name; `query` is whatever you decided is the best attempt. If
+   your first query comes back empty or wrong, try another value from
+   row_data before giving up on that holding.
 2. Pick the best real candidate from that call's own results — prefer a
    `.NS` listing over `.BO` for the same company. The tool already filters
    to NSE/BSE equity listings, but still reject a candidate that's obviously
@@ -93,6 +128,14 @@ name you were given, even the ones you can't resolve:
 [{"name": "...", "symbol": "TICKER.NS" | null,
   "confidence": "high" | "medium" | "low", "reasoning": "...",
   "duplicate_of": "<other name from the input>" | null}, ...]
+
+`reasoning` is printed straight to a terminal during first-time setup, not
+a report — keep it to ONE short sentence (under ~20 words) naming the
+specific issue (e.g. "TMCV.NS and TMCV.BO both match; NSE listing
+preferred" or "same quantity as TATA MOTORS LIMITED, likely a demerger
+split, not a duplicate"). Do not write a paragraph walking through your
+reasoning process; a human deciding whether to trust a "?" line reads one
+line, not a wall of text.
 """
 
 
@@ -109,27 +152,53 @@ class ResolvedName:
     duplicate_of: str | None = None
     sector: str | None = None
     company_name: str | None = None
+    # Carried straight from the input holding (see discover_unmapped_full_
+    # names), not something the agent itself returns — set by resolve_names
+    # after _validate, so it survives into a caller's interactive fallback
+    # (cli.py's _confirm_unmapped) even on the residual case where
+    # searching this same hint didn't itself produce a validated match.
+    candidate_symbol: str | None = None
+    # Same provenance as candidate_symbol — carried through so a human in
+    # cli.py's interactive fallback can read the raw row themselves on the
+    # residual case where neither this agent nor candidate_symbol's cheap
+    # heuristic found anything worth trusting. Real understanding — an
+    # actual person, or the agent above — over a fixed set of column-shape
+    # rules is the whole point; a human should get the same raw material
+    # the agent did, not just its (possibly wrong) conclusion.
+    row_data: dict[str, str] | None = None
 
 
 def _build_search_tool(evidence: dict[str, list[dict]]):
     """search_ticker_by_name, scoped to one run. Every call's real results
-    get recorded into `evidence` (keyed by the exact name queried) so
-    _validate can check the agent's claims against them afterward — the
-    actual gate; the system prompt's instruction alone is not trusted."""
+    get recorded into `evidence` — keyed by `for_holding` (the exact
+    holding name from the input list), NOT by whatever text was actually
+    searched — so _validate can check a claim against everything searched
+    FOR that holding regardless of what query text worked best. Splitting
+    "which holding is this evidence for" from "what to actually search"
+    is what lets the agent search a clean candidate_symbol hint (see
+    resolve_names/SYSTEM_PROMPT) instead of being stuck re-searching a
+    PDF-mangled full name and coming back empty, while "a claim must trace
+    to a real search FOR THIS HOLDING" stays exactly as strict as before —
+    the system prompt's instruction alone is not trusted either way."""
 
     @tool(
         "search_ticker_by_name",
-        "Search yfinance for NSE/BSE equity listings matching a company "
-        "name. Returns every real Indian-exchange match found — the only "
-        "candidates a resolution may be drawn from.",
-        {"name": str},
+        "Search yfinance for NSE/BSE equity listings. `for_holding` MUST "
+        "be the exact holding name from your input list — identifies "
+        "which holding this search is evidence for; required on every "
+        "call. `query` is the actual search text: the holding's "
+        "candidate_symbol if it has one, otherwise the company name. "
+        "Returns every real Indian-exchange match found — the only "
+        "candidates a resolution for that holding may be drawn from.",
+        {"for_holding": str, "query": str},
     )
     async def search_ticker_by_name(args: dict) -> dict:
         import yfinance as yf
 
-        name = str(args.get("name", "")).strip()
+        for_holding = str(args.get("for_holding", "")).strip()
+        query = str(args.get("query", "")).strip() or for_holding
         try:
-            quotes = yf.Search(name, max_results=8).quotes
+            quotes = yf.Search(query, max_results=8).quotes
         except Exception as exc:
             return {
                 "content": [{"type": "text", "text": json.dumps({"error": str(exc)})}],
@@ -146,7 +215,7 @@ def _build_search_tool(evidence: dict[str, list[dict]]):
             for q in quotes
             if q.get("quoteType") == "EQUITY" and q.get("exchange") in ("NSI", "BSE")
         ]
-        evidence.setdefault(name, []).extend(candidates)
+        evidence.setdefault(for_holding, []).extend(candidates)
         return {"content": [{"type": "text", "text": json.dumps({"candidates": candidates})}]}
 
     return search_ticker_by_name
@@ -312,5 +381,17 @@ async def resolve_names(holdings: list[dict]) -> list[ResolvedName]:
                 name=h["name"], symbol=None, confidence="low",
                 reasoning="Agent did not return a result for this name.",
             ))
+
+    # candidate_symbol and row_data are INPUT fields (see
+    # discover_unmapped_full_names), not part of the agent's own output
+    # schema — carry them through onto every result regardless of what the
+    # agent did with them, so a caller's interactive fallback still has
+    # them even when the agent's own read of row_data didn't produce a
+    # validated match (thin/no yfinance coverage, an odd listing, ...).
+    by_name = {h["name"]: h for h in holdings}
+    for r in resolved:
+        h = by_name.get(r.name, {})
+        r.candidate_symbol = h.get("candidate_symbol")
+        r.row_data = h.get("row_data")
 
     return resolved

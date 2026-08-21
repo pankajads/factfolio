@@ -14,13 +14,39 @@ This module handles that mess as an ADDITIVE source, not a replacement:
   2. Scan every row for one that looks like a header — matched by keyword,
      not exact name — and classify it as an equity or mutual-fund table.
   3. Slice to just the data rows (stop at a blank row or a "Total" row).
-  4. Map columns by keyword-containment and build the same EquityPosition /
-     MFPosition dataclasses loader.py uses everywhere else downstream.
+  4. Map columns by keyword-containment (falling back to a learned
+     AI-assisted mapping — see "Column-map cache" below — before this
+     module's own deterministic heuristics give up) and build the same
+     EquityPosition / MFPosition dataclasses loader.py uses everywhere
+     else downstream.
 
 A column or row this cannot confidently interpret is skipped with a warning
 — never silently zeroed, matching loader.py's rule. A file this cannot
 classify at all raises, naming the file, rather than pretending it found
 nothing.
+
+## Column-map cache
+
+The keyword-based matching above is fast, free, and right most of the
+time — it stays the first thing tried, always. But it's still a fixed set
+of rules, and every genuinely new broker/DP export format hit in practice
+so far needed another one (a keyword reorder, a whitespace-collapsing
+fallback for PDF-wrapped headers, a candidate-symbol scan for a swapped
+column) — correct for the file that prompted it, but a code change for
+every future format nobody's seen yet. That doesn't scale to formats this
+project's author can't predict.
+
+When the deterministic path can't resolve a file's required columns,
+agents/schema_resolver.py can be asked (interactively, at `factfolio
+validate` — never automatically, and never from load_portfolio()'s own
+call path, so `status` stays exactly as deterministic as it's always been)
+to read the header and real sample rows and propose a mapping, the same
+"propose it, then verify it against real data before trusting it" pattern
+already used for ticker-name resolution (agents/ticker_resolver.py). A
+mapping that passes validate_schema's grounding check gets written to
+config.COLUMN_MAP_CACHE, keyed by header signature — not filename — so
+the SAME broker/DP format is recognised immediately in any FUTURE file
+too, without ever asking again or needing another code change.
 """
 
 from __future__ import annotations
@@ -29,7 +55,6 @@ import re
 from pathlib import Path
 from typing import Literal
 
-from mybroker.config import HOLDINGS_INBOX_DIR
 from mybroker.portfolio.loader import (
     EquityPosition,
     MFPosition,
@@ -67,10 +92,31 @@ def _loose_norm(cell: object) -> str:
 
 def _find_col(header_loose: list[str], *keyword_sets: tuple[str, ...]) -> int | None:
     """First column whose loose header contains every keyword in one of the
-    given sets, trying sets in order (most specific first)."""
+    given sets, trying sets in order (most specific first).
+
+    Falls back to a whitespace-collapsed re-check of the SAME keyword sets
+    before giving up — a PDF's own table extraction wraps a single word
+    across a narrow header cell ("InvestmentValue" → "Investme" + " " +
+    "ntValue"), which breaks a plain substring check even though the
+    header, read as a human would read it, obviously says "Investment
+    Value"; collapsing internal whitespace within one header cell before
+    re-testing repairs exactly that, without ever merging separate
+    columns into each other (each cell is still checked on its own). Tried
+    only as a fallback, after every keyword set has already had a fair
+    exact-text shot across every column — a genuinely two-word keyword
+    match ("scheme", "name") on an UNWRAPPED, correctly-spelled header
+    still needs both real words present in the exact check; the fallback
+    exists for wrap damage, not to make matching looser in general.
+    """
     for kws in keyword_sets:
         for i, cell in enumerate(header_loose):
             if all(kw in cell for kw in kws):
+                return i
+    for kws in keyword_sets:
+        tight_kws = ["".join(kw.split()) for kw in kws]
+        for i, cell in enumerate(header_loose):
+            tight_cell = "".join(cell.split())
+            if all(kw in tight_cell for kw in tight_kws):
                 return i
     return None
 
@@ -119,16 +165,28 @@ def _read_txt_grid(path: Path) -> Grid:
 def _read_excel_grid(path: Path) -> Grid:
     import contextlib
     import io
+    import warnings
 
     import pandas as pd
 
-    # xlrd `print()`s (not `warnings.warn`s — can't be filtered the normal
-    # way) a benign notice, "WARNING *** file size ... not 512 + multiple of
-    # sector size", for real-world .xls exports whose trailing sector is
-    # short. It still parses the file correctly — this is stdout noise, not
-    # a signal, and having it appear ahead of an unrelated failure makes
-    # that failure look scarier than it is. Swallow it.
-    with contextlib.redirect_stdout(io.StringIO()):
+    # Two independent noise sources here, neither a real signal, both
+    # swallowed the same way any other "harmless but alarming-looking"
+    # library chatter is treated elsewhere in this file:
+    #   - xlrd `print()`s (not `warnings.warn`s — stdout, not filterable
+    #     via the warnings module) a benign notice, "WARNING *** file size
+    #     ... not 512 + multiple of sector size", for real-world .xls
+    #     exports whose trailing sector is short. Parses fine regardless.
+    #   - openpyxl `warnings.warn()`s "Workbook contains no default style"
+    #     for a real-world .xlsx that's missing an optional style table —
+    #     also parses fine, and — because this file gets read multiple
+    #     times per `factfolio validate`/`init` run (classification,
+    #     drafting, extraction all read it independently) — printed
+    #     six-plus times in a row for one command, which is what actually
+    #     made a real user's terminal output feel broken, not the data.
+    # Every call in this file goes through here, so both are caught
+    # regardless of which specific read triggered them.
+    with contextlib.redirect_stdout(io.StringIO()), warnings.catch_warnings():
+        warnings.simplefilter("ignore")
         try:
             df = pd.read_excel(path, header=None, dtype=str)
         except ValueError as exc:
@@ -278,8 +336,16 @@ _EQUITY_COL_KEYWORDS: dict[str, tuple[tuple[str, ...], ...]] = {
         ("avg", "rate"), ("buy", "price"), ("purchase", "price"),
     ),
     "ltp": (("ltp",), ("last", "price"), ("market", "price"), ("current", "price")),
+    # ("investment",) tried before the bare ("invested",): a real broker
+    # column literally called "DivReinvested" contains "invested" as a
+    # plain substring ("re" + "invested") — no wrap damage needed for that
+    # false match, just bad luck with an ambiguous single-word keyword.
+    # "investment" doesn't have that problem (no MF/equity column spells a
+    # word containing "investment" as an accidental substring the way
+    # "reinvested" does for "invested"), so it goes first; the bare form
+    # stays as the last-resort fallback, not the first guess.
     "invested": (
-        ("invested",), ("investment",), ("cost", "value"), ("cost", "acquisition"),
+        ("investment",), ("cost", "value"), ("cost", "acquisition"), ("invested",),
     ),
     "current_value": (("current", "value"), ("market", "value"), ("cur", "val")),
     "pnl": (("p l",), ("profit", "loss"), ("gain", "loss"), ("pl",)),
@@ -292,12 +358,22 @@ _MF_COL_KEYWORDS: dict[str, tuple[tuple[str, ...], ...]] = {
     "scheme_name": (("scheme", "name"), ("fund", "name"), ("scheme",)),
     "amfi_code": (("amfi",), ("scheme", "code")),
     "units": (("holding", "units"), ("units",), ("qty",)),
-    "avg_nav": (("avg", "nav"), ("average", "nav"), ("avg", "cost")),
+    "avg_nav": (("avg", "nav"), ("average", "nav"), ("avg", "cost"), ("average", "cost")),
     "current_nav": (("current", "nav"),),
-    "invested": (("invested",), ("investment",), ("cost", "value")),
+    "invested": (("investment",), ("cost", "value"), ("invested",)),
     "current_value": (("current", "value"), ("market", "value"), ("cur", "val")),
     "category": (("category",), ("scheme", "type")),
 }
+
+# The ground truth for what fields exist and which are load-bearing —
+# agents/schema_resolver.py imports these directly rather than keeping its
+# own copy, so the AI-assisted fallback path always asks about (and
+# requires) exactly the same fields the deterministic path does.
+EQUITY_REQUIRED = ("symbol", "quantity", "avg_cost", "invested", "current_value")
+EQUITY_ALL_FIELDS = tuple(_EQUITY_COL_KEYWORDS)  # dict preserves insertion order
+
+MF_REQUIRED = ("scheme_name", "invested", "current_value")
+MF_ALL_FIELDS = tuple(_MF_COL_KEYWORDS)
 
 
 def _resolve_columns(
@@ -327,11 +403,185 @@ def _data_rows(grid: Grid, header_row: int) -> list[list[str]]:
     return out
 
 
+# ── AI-assisted column-map cache ────────────────────────────────────────────
+# See this module's own docstring ("Column-map cache") for the full picture.
+# Everything below is pure data plumbing and validation — the actual AI call
+# lives in agents/schema_resolver.py; nothing here ever talks to a model.
+
+def _header_signature(header_loose: list[str]) -> str:
+    """A stable, human-inspectable key for one header row's exact shape —
+    the loose-normalized cells joined, not a hash, so
+    config.COLUMN_MAP_CACHE stays as readable/greppable as tickers.yaml
+    is, not an opaque lookup table."""
+    return "|".join(header_loose)
+
+
+def load_column_map_cache() -> dict[str, dict]:
+    import json
+
+    from mybroker.config import COLUMN_MAP_CACHE
+
+    if not COLUMN_MAP_CACHE.exists():
+        return {}
+    try:
+        data = json.loads(COLUMN_MAP_CACHE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_column_map(
+    header: list[str], *, kind: str, columns: dict[str, int | None],
+    source: str, confidence: str, reasoning: str,
+) -> None:
+    """Persist a column mapping — call only after validate_schema has
+    already passed it; this function itself does no checking, it just
+    writes whatever it's given. `header` is the RAW header row (as read
+    from the file, same shape find_unresolvable_files hands a caller) —
+    normalized internally so callers never need this module's own private
+    _loose_norm."""
+    import json
+    from datetime import UTC, datetime
+
+    from mybroker.config import COLUMN_MAP_CACHE
+
+    header_loose = [_loose_norm(c) for c in header]
+    cache = load_column_map_cache()
+    cache[_header_signature(header_loose)] = {
+        "kind": kind,
+        "columns": columns,
+        "confidence": confidence,
+        "reasoning": reasoning,
+        "learned_from": source,
+        "learned_at": datetime.now(UTC).isoformat(),
+    }
+    COLUMN_MAP_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    COLUMN_MAP_CACHE.write_text(json.dumps(cache, indent=2), encoding="utf-8")
+
+
+def _cached_mapping_for_row(header_loose: list[str]) -> tuple[Kind, dict[str, int | None]] | None:
+    """Whether THIS ONE row's exact header signature matches a previously
+    learned-and-validated mapping — checked for every candidate row
+    extract_positions' table scan considers, before falling back to
+    keyword classification, so a format already resolved once (a human
+    confirming an AI-assisted mapping, at `factfolio validate`) is
+    recognised instantly in any future file sharing that header, without
+    asking again or needing another code change."""
+    cache = load_column_map_cache()
+    entry = cache.get(_header_signature(header_loose))
+    if entry:
+        return entry["kind"], entry["columns"]
+    return None
+
+
+def _looks_numeric(value: str) -> bool:
+    """Same tolerant cleanup as loader.py's _num, but returning a bool
+    rather than raising or parsing — used only to check whether an
+    agent's claim about a column holds up, never to read a real value."""
+    if not value:
+        return False
+    cleaned = value.strip().replace(",", "").replace("₹", "")
+    if cleaned in ("-", "--", "NA", "N/A"):
+        return True  # a legitimate "blank" numeric cell, not text
+    try:
+        float(cleaned)
+        return True
+    except ValueError:
+        return False
+
+
+_NUMERIC_FIELDS = {
+    "quantity", "avg_cost", "ltp", "invested", "current_value", "pnl",
+    "net_change_pct", "day_change_pct", "units", "avg_nav", "current_nav",
+}
+_TEXT_FIELDS = {"symbol", "scheme_name"}
+
+
+def validate_schema(
+    kind: str | None, columns: dict[str, int | None], grid: Grid,
+    header_row: int | None,
+) -> tuple[bool, list[str]]:
+    """The actual gate an agent-proposed column mapping must clear before
+    anything here trusts it — checked against the file's own REAL data
+    (every data row, not just the handful of sample rows the agent saw),
+    the same "a claim must be grounded in real evidence" discipline
+    agents/ticker_resolver.py's _validate applies to a search result,
+    applied here to column semantics instead. Returns (ok, problems);
+    problems is always populated, human-readably, when ok is False.
+
+    header_row now comes from the agent's OWN read of the file (see
+    agents/schema_resolver.py — it isn't told where the header is any
+    more than a human would be) rather than being known in advance, so
+    it's validated here too: null (the agent couldn't find one at all)
+    or out of range is rejected the same as any other ungrounded claim.
+    """
+    problems: list[str] = []
+
+    if kind not in ("equity", "mf"):
+        return False, [f"unrecognised kind {kind!r} (must be 'equity' or 'mf')"]
+
+    if not isinstance(header_row, int) or header_row < 0 or header_row >= len(grid):
+        return False, [f"header_row {header_row!r} is not a valid row index"]
+
+    n_cols = len(grid[header_row])
+    data_rows = _data_rows(grid, header_row)
+    if not data_rows:
+        return False, ["no data rows to validate the claimed mapping against"]
+
+    for field_name, col in columns.items():
+        if col is None:
+            continue
+        if not isinstance(col, int) or col < 0 or col >= n_cols:
+            problems.append(f"{field_name}: column index {col!r} is out of range")
+            continue
+
+        values = [_cell(r, col).strip() for r in data_rows]
+        values = [v for v in values if v]
+        if not values:
+            problems.append(
+                f"{field_name}: column {col} ({grid[header_row][col]!r}) is "
+                f"empty in every data row"
+            )
+            continue
+
+        if field_name in _NUMERIC_FIELDS:
+            bad = [v for v in values if not _looks_numeric(v)]
+            # Tolerate a stray blank/dash/footnote — reject only if the
+            # column is predominantly non-numeric.
+            if len(bad) > max(1, len(values) * 0.2):
+                problems.append(
+                    f"{field_name}: column {col} ({grid[header_row][col]!r}) "
+                    f"doesn't look numeric — e.g. {bad[0]!r}"
+                )
+        elif field_name in _TEXT_FIELDS and all(_looks_numeric(v) for v in values):
+            problems.append(
+                f"{field_name}: column {col} ({grid[header_row][col]!r}) "
+                f"looks purely numeric, not a name/symbol"
+            )
+
+    required = EQUITY_REQUIRED if kind == "equity" else MF_REQUIRED
+    missing = [f for f in required if columns.get(f) is None]
+    if missing:
+        problems.append(f"missing required field(s) for {kind}: {list(missing)}")
+
+    return not problems, problems
+
+
 def _rows_to_equity(
-    grid: Grid, header_row: int, *, source: str
+    grid: Grid, header_row: int, *, source: str,
+    column_override: dict[str, int | None] | None = None,
 ) -> tuple[list[EquityPosition], list[str]]:
-    header_loose = [_loose_norm(c) for c in grid[header_row]]
-    idx = _resolve_columns(header_loose, _EQUITY_COL_KEYWORDS)
+    # column_override — a mapping already learned via AI-assisted schema
+    # resolution and validated against this file's own data (see
+    # validate_schema/load_column_map) — replaces keyword matching
+    # entirely for this file when present, rather than merging with it:
+    # a human/agent already looked at the real data and settled this, so
+    # there's nothing left for the keyword heuristics to add.
+    if column_override is not None:
+        idx = {k: v for k, v in column_override.items() if v is not None}
+    else:
+        header_loose = [_loose_norm(c) for c in grid[header_row]]
+        idx = _resolve_columns(header_loose, _EQUITY_COL_KEYWORDS)
 
     # invested/current_value each need either their own explicit column, OR
     # enough to derive them (qty*avg_cost, qty*ltp) — the same fallback
@@ -399,18 +649,46 @@ def _rows_to_equity(
 
 
 def _rows_to_mf(
-    grid: Grid, header_row: int, *, source: str
+    grid: Grid, header_row: int, *, source: str,
+    column_override: dict[str, int | None] | None = None,
 ) -> tuple[list[MFPosition], list[str]]:
-    header_loose = [_loose_norm(c) for c in grid[header_row]]
-    idx = _resolve_columns(header_loose, _MF_COL_KEYWORDS)
+    # See _rows_to_equity's own comment on column_override — same idea.
+    if column_override is not None:
+        idx = {k: v for k, v in column_override.items() if v is not None}
+    else:
+        header_loose = [_loose_norm(c) for c in grid[header_row]]
+        idx = _resolve_columns(header_loose, _MF_COL_KEYWORDS)
     if "scheme_name" not in idx:
         raise ValueError(
             f"{source}: could not find a scheme-name column in the detected "
             f"mutual-fund header {grid[header_row]!r}."
         )
 
+    # Same rule loader.py states up front for the whole module: a column
+    # that can't be interpreted is an error, never a silent zero. Without
+    # this check, a header this couldn't map "invested" or "current_value"
+    # (directly, or derivable from units × nav) for — the exact failure
+    # mode a badly PDF-wrapped header produces — used to build every
+    # position anyway, just with invested=0 and current_value=0: real
+    # holdings worth real money, silently reported as worthless, with
+    # nothing anywhere saying why.
+    can_derive_invested = {"units", "avg_nav"} <= idx.keys()
+    can_derive_current = {"units", "current_nav"} <= idx.keys()
+    missing = set()
+    if "invested" not in idx and not can_derive_invested:
+        missing.add("invested")
+    if "current_value" not in idx and not can_derive_current:
+        missing.add("current_value")
+    if missing:
+        raise ValueError(
+            f"{source}: could not find column(s) {sorted(missing)} (or enough "
+            f"to derive them from units × NAV) in the detected mutual-fund "
+            f"header {grid[header_row]!r}."
+        )
+
     positions: list[MFPosition] = []
     warnings: list[str] = []
+    no_amfi_code = 0
 
     for rownum, row in enumerate(_data_rows(grid, header_row), start=header_row + 2):
         name = _cell(row, idx["scheme_name"]).strip()
@@ -435,10 +713,7 @@ def _rows_to_mf(
 
         code = _cell(row, idx.get("amfi_code")).strip()
         if not code:
-            warnings.append(
-                f"{source}: {name}: no AMFI code — NAV lookups and overlap "
-                f"analysis will be unavailable for this scheme."
-            )
+            no_amfi_code += 1
 
         positions.append(
             MFPosition(
@@ -454,44 +729,116 @@ def _rows_to_mf(
             )
         )
 
+    if no_amfi_code:
+        # One line, not one per scheme — a direct-plan investor's own
+        # statement never carries an AMFI code at all (there's no
+        # distributor/broker to populate one), so this fires for EVERY
+        # scheme, every time, permanently. Repeating an identical warning
+        # 19 times drowns out everything else in the output for a state
+        # that isn't a data problem to go fix; it's just how a direct
+        # investor's statement looks. folio (see metrics.py's snapshot,
+        # which uses it to disambiguate same-name holdings) is the actual
+        # working substitute for "which holding is this" — AMFI code is
+        # specifically about NAV lookups/overlap analysis, which folio
+        # genuinely can't provide, so this still says so honestly, just
+        # once.
+        plural = "" if no_amfi_code == 1 else "s"
+        warnings.append(
+            f"{source}: {no_amfi_code} scheme{plural} with no AMFI code — "
+            f"expected for direct-plan holdings (no distributor to supply "
+            f"one). NAV lookups and overlap analysis will be unavailable "
+            f"for {'it' if no_amfi_code == 1 else 'them'}; folio number is "
+            f"used to tell holdings apart instead."
+        )
+
     return positions, warnings
 
 
 # ── Entry point ──────────────────────────────────────────────────────────────
-def extract_positions(
-    path: Path,
-) -> tuple[Kind, list[EquityPosition] | list[MFPosition], list[str]]:
-    """Sniff, classify and parse one holdings file. Raises ValueError if no
-    header row can be classified, or if a classified header is missing
-    required columns — both name the file, never fail silently."""
-    grid = read_grid(path)
+def _extract_all_tables(
+    grid: Grid, source: str,
+) -> tuple[list[EquityPosition], list[MFPosition], list[str]]:
+    """Scan the WHOLE file for every holdings table it contains — not just
+    the first. A consolidated broker/DP statement can legitimately hold
+    BOTH an equity table and a mutual-fund table as separate sections of
+    the same file; stopping at the first classifiable header (the old
+    behaviour) silently dropped whatever came after it entirely, with no
+    warning anywhere in the whole system — real holdings, real money,
+    invisible. Real users hit exactly this.
 
-    header_row: int | None = None
-    kind: Kind | None = None
-    for i, row in enumerate(grid):
-        loose = [_loose_norm(c) for c in row]
-        classified = _classify_row(loose)
-        if classified:
-            header_row, kind = i, classified
-            break
+    Each candidate header row found is resolved via the column-map cache
+    first (see _cached_mapping_for_row), falling back to keyword
+    classification — same priority as before, just applied per-table
+    instead of once for the whole file. One table failing to resolve its
+    columns does not block another, different table elsewhere in the same
+    file from still being extracted — its error becomes a warning
+    alongside whatever DID succeed, not a hard failure, unless NOTHING in
+    the entire file could be read at all (still a ValueError, same as
+    before, so find_unresolvable_files/AI-assisted schema resolution
+    still applies to that case).
+    """
+    equity: list[EquityPosition] = []
+    mfs: list[MFPosition] = []
+    warnings: list[str] = []
+    table_errors: list[str] = []
+    tables_found = 0
 
-    if header_row is None or kind is None:
+    i = 0
+    while i < len(grid):
+        loose = [_loose_norm(c) for c in grid[i]]
+        cached = _cached_mapping_for_row(loose)
+        kind: Kind | None = cached[0] if cached else _classify_row(loose)
+
+        if not kind:
+            i += 1
+            continue
+
+        tables_found += 1
+        columns = cached[1] if cached else None
+        try:
+            if kind == "equity":
+                positions, w = _rows_to_equity(
+                    grid, i, source=source, column_override=columns
+                )
+                equity.extend(positions)
+            else:
+                positions, w = _rows_to_mf(
+                    grid, i, source=source, column_override=columns
+                )
+                mfs.extend(positions)
+            warnings.extend(w)
+        except ValueError as exc:
+            table_errors.append(str(exc))
+
+        # Resume scanning right after this table's own data rows, so its
+        # data can't be mistaken for a second header further down.
+        i += 1 + len(_data_rows(grid, i))
+
+    if tables_found == 0:
         raise ValueError(
-            f"{path}: could not find a recognisable equity or mutual-fund "
+            f"{source}: could not find a recognisable equity or mutual-fund "
             f"header row. Expected keywords like 'Instrument'/'Qty' (equity) "
             f"or 'Folio'/'Scheme Name' (mutual fund) somewhere in the file."
         )
 
-    source = path.name
-    if kind == "equity":
-        positions, warnings = _rows_to_equity(grid, header_row, source=source)
-    else:
-        positions, warnings = _rows_to_mf(grid, header_row, source=source)
+    if not equity and not mfs:
+        # Every table found failed to resolve — nothing usable came out of
+        # this file at all, so this stays a hard failure (same as always),
+        # not a warning nobody would ever see.
+        raise ValueError("; ".join(table_errors))
 
-    if not positions:
-        warnings.append(f"{source}: header row found but no data rows parsed.")
+    warnings.extend(table_errors)
+    return equity, mfs, warnings
 
-    return kind, positions, warnings
+
+def extract_positions(
+    path: Path,
+) -> tuple[list[EquityPosition], list[MFPosition], list[str]]:
+    """Sniff, classify and parse every holdings table in one file — see
+    _extract_all_tables for why this is plural, not singular. Raises
+    ValueError if nothing in the file could be read at all."""
+    grid = read_grid(path)
+    return _extract_all_tables(grid, path.name)
 
 
 _CLEAN_SYMBOL = re.compile(r"^[A-Z0-9&\-]+$")
@@ -595,6 +942,105 @@ def discover_equity_symbols_for_drafting(path: Path) -> set[str]:
     return set()
 
 
+_MAX_CANDIDATE_SYMBOL_LEN = 15
+
+
+def _looks_like_a_wrapped_symbol(value: str) -> bool:
+    """True if `value` plausibly reads as ONE genuine trading symbol split
+    across at most two PDF-wrapped lines (a narrow column wrapping
+    "HDFCBANK" into "HDFCBAN\\nK", collapsed by _clean_pdf_cell's
+    whitespace-preserving join into "HDFCBAN K") — as opposed to a full
+    company name that also happens to contain spaces. Blindly stripping
+    every space and re-checking _CLEAN_SYMBOL alone would treat "AXIS BANK
+    LIMITED" (→ "AXISBANKLIMITED") as equally "clean"; the token-count and
+    length limits below are what keep those apart — a real wrapped symbol
+    is at most two fragments and stays short even joined, while a company
+    name is usually three-plus words and/or too long once joined.
+    """
+    tokens = value.split()
+    if not tokens or len(tokens) > 2:
+        return False
+    joined = "".join(tokens)
+    return (
+        len(joined) <= _MAX_CANDIDATE_SYMBOL_LEN
+        and bool(_CLEAN_SYMBOL.match(joined))
+        and any(ch.isalpha() for ch in joined)
+    )
+
+
+def _find_candidate_symbol_column(
+    grid: Grid, header_row: int, exclude: set[int]
+) -> int | None:
+    """A column OTHER than the one already identified as the name column
+    whose data plausibly holds a genuine short trading symbol per holding
+    — a HINT only, never auto-drafted or auto-written anywhere (see
+    discover_unmapped_full_names, its only caller, and contrast with
+    discover_equity_symbols_for_drafting's deliberately unmoved "give up
+    rather than guess" gate). Exists because a real broker PDF's own table
+    extraction can put the actual code in a column whose HEADER doesn't
+    match any of _EQUITY_COL_KEYWORDS at all — one real statement's column
+    literally labelled "Stock Name" holds "AXISBANK", while the column
+    that keyword-matches as the symbol column ("SKScrip Code") holds the
+    full company name instead. The code exists in the file, just under a
+    header nothing here goes looking for — discarding it entirely (the old
+    behaviour) sent every holding through AI-assisted name resolution for
+    a symbol that was already sitting one column over, unused. Surfacing
+    it as `candidate_symbol` lets the resolver (or a human, interactively)
+    verify and use it directly instead.
+
+    Stricter than _looks_like_a_symbol_column on purpose: also requires at
+    least one letter (rules out a numeric internal row/customer ID, which
+    would otherwise pass the same character-class check just as easily as
+    a real symbol) and that most rows differ from each other (rules out a
+    repeated account ID or a constant Y/N flag column — both of which are
+    "clean" by character shape alone). Returns the column only if it's the
+    SOLE one satisfying all of this; multiple candidates is genuine
+    ambiguity, not a hint worth surfacing.
+    """
+    candidates: list[int] = []
+    for col in range(len(grid[header_row])):
+        if col in exclude:
+            continue
+        values = [_cell(r, col).strip().upper() for r in _data_rows(grid, header_row)]
+        values = [v for v in values if v and not _looks_like_a_bond(v)]
+        if not values:
+            continue
+        clean = sum(1 for v in values if _looks_like_a_wrapped_symbol(v))
+        if clean / len(values) < 0.8:
+            continue
+        if len(set(values)) / len(values) < 0.5:
+            continue
+        candidates.append(col)
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _row_as_dict(grid: Grid, header_row: int, data_row: list[str]) -> dict[str, str]:
+    """`data_row` as a plain {header label: value} dict — the RAW label
+    from the file itself, not loose-normalized, and every column, not
+    just the ones _EQUITY_COL_KEYWORDS happens to recognize. This is the
+    actual fix for only ever handing downstream resolution a single
+    Python-guessed column: rather than this module deciding which one
+    column might matter and discarding the rest, the whole row goes to
+    whoever resolves the name (an AI agent, or a human in an interactive
+    prompt) so THEY can read it and notice what a fixed set of shape
+    heuristics might not — a differently-named code column, an ISIN, a
+    BSE scrip code, anything. A header repeated across columns (a broker
+    export with two same-named columns) gets suffixed so neither silently
+    overwrites the other in the dict.
+    """
+    out: dict[str, str] = {}
+    seen: dict[str, int] = {}
+    for col, header in enumerate(grid[header_row]):
+        label = header.strip()
+        if not label:
+            continue
+        n = seen.get(label, 0)
+        seen[label] = n + 1
+        key = label if n == 0 else f"{label} ({n + 1})"
+        out[key] = _cell(data_row, col).strip()
+    return out
+
+
 def discover_unmapped_full_names(path: Path) -> list[dict]:
     """The mirror image of discover_equity_symbols_for_drafting: every
     full-company-name-ish holding in `path` — a source like Sharekhan's
@@ -613,8 +1059,16 @@ def discover_unmapped_full_names(path: Path) -> list[dict]:
     validation gate first.
 
     Best-effort and silent on any failure, same contract as
-    discover_equity_symbols_for_drafting. Returns
-    `[{"name": ..., "quantity": ..., "avg_cost": ...}, ...]`.
+    discover_equity_symbols_for_drafting. Returns `[{"name": ...,
+    "quantity": ..., "avg_cost": ..., "candidate_symbol": ..., "row_data":
+    {...}}, ...]`. candidate_symbol is a cheap, free, no-agent-call hint —
+    present only when _find_candidate_symbol_column found exactly one
+    unambiguous shape-match elsewhere in the row, and deliberately narrow
+    (a fixed statistical heuristic will always miss real-world layouts it
+    wasn't tuned against). row_data is the actual fix for that ceiling:
+    every column of the row, raw, unfiltered — so the agent (or a human,
+    interactively) can read the whole thing and use real judgement, not
+    just whatever this module's own heuristics happened to notice.
     """
     from mybroker.config import resolve_symbol_by_name
 
@@ -632,6 +1086,10 @@ def discover_unmapped_full_names(path: Path) -> list[dict]:
         if sym_col is None or _looks_like_a_symbol_column(grid, i, sym_col):
             return []  # a genuine symbol column — discover_equity_symbols_for_drafting's job
 
+        candidate_col = _find_candidate_symbol_column(
+            grid, i, exclude={sym_col} if sym_col is not None else set()
+        )
+
         holdings: list[dict] = []
         seen: set[str] = set()
         for rownum, data_row in enumerate(_data_rows(grid, i), start=i + 2):
@@ -641,13 +1099,19 @@ def discover_unmapped_full_names(path: Path) -> list[dict]:
             if resolve_symbol_by_name(raw) is not None:
                 continue
             seen.add(raw)
-            holdings.append({
+            entry = {
                 "name": raw,
                 "quantity": _num(_cell(data_row, idx.get("quantity")), field_name="quantity", row=rownum)
                 if idx.get("quantity") is not None else None,
                 "avg_cost": _num(_cell(data_row, idx.get("avg_cost")), field_name="avg_cost", row=rownum)
                 if idx.get("avg_cost") is not None else None,
-            })
+                "row_data": _row_as_dict(grid, i, data_row),
+            }
+            if candidate_col is not None:
+                hint = "".join(_cell(data_row, candidate_col).split()).upper()
+                if hint:
+                    entry["candidate_symbol"] = hint
+            holdings.append(entry)
         return holdings
 
     return []
@@ -656,10 +1120,70 @@ def discover_unmapped_full_names(path: Path) -> list[dict]:
 def discover_inbox_files(inbox_dir: Path | None = None) -> list[Path]:
     """Every supported-format file directly inside the inbox dir, sorted for
     deterministic ordering. Missing directory → empty list, not an error."""
-    inbox_dir = inbox_dir or HOLDINGS_INBOX_DIR
+    if inbox_dir is None:
+        # Deliberately a lazy import, not a module-level one — this used
+        # to bind HOLDINGS_INBOX_DIR once at first import of this module,
+        # which then never noticed `factfolio init` repointing
+        # PROJECT_ROOT mid-process, or a test's config.set_project_root()
+        # — every caller relying on this default silently kept scanning
+        # the FIRST project root this module ever saw, not the current
+        # one. Every other reader of config.HOLDINGS_INBOX_DIR in this
+        # codebase (portfolio/loader.py's load_portfolio, ticker_seeding
+        # .py's holdings_present) already imports it fresh inside the
+        # function for the same reason.
+        from mybroker.config import HOLDINGS_INBOX_DIR
+
+        inbox_dir = HOLDINGS_INBOX_DIR
     if not inbox_dir.exists():
         return []
     return sorted(
         p for p in inbox_dir.iterdir()
         if p.is_file() and p.suffix.lower() in SUPPORTED_SUFFIXES
     )
+
+
+_SCHEMA_EXCERPT_ROWS = 30
+
+
+def find_unresolvable_files(inbox_dir: Path | None = None) -> list[dict]:
+    """Every holdings_inbox file _extract_all_tables can't get ANYTHING
+    out of at all — whether because no header row could even be
+    recognised by keyword (a genuinely novel export using different
+    terminology throughout, not just an unfamiliar column name) or
+    because every table it did find failed to resolve its required
+    columns. Both are exactly what AI-assisted schema resolution
+    (agents/schema_resolver.py) exists for: it isn't told where the
+    header is any more than a human opening the file for the first time
+    would be — it reads the raw excerpt and figures out the whole
+    structure itself, so it isn't limited to only the narrower of the two
+    failure modes the way a pre-picked-header design would be. A file
+    with ONE good table and ONE bad one isn't flagged here at all — the
+    good table's data is real and already extracted; see the returned
+    warning list from load_portfolio for the bad one instead, the same
+    partial-success handling every other holdings source gets.
+
+    Returns `[{"path": Path, "grid": Grid, "grid_excerpt": Grid, "error":
+    str}, ...]` — everything a caller (cli.py) needs to both show the
+    problem to a human and hand the raw material straight to the resolver
+    without re-reading the file. grid_excerpt is capped at the first
+    _SCHEMA_EXCERPT_ROWS rows — plenty for any real statement's header
+    plus a few data rows, without shipping an entire large file to the
+    agent.
+    """
+    out: list[dict] = []
+    for path in discover_inbox_files(inbox_dir):
+        try:
+            grid = read_grid(path)
+        except Exception:
+            continue  # a different failure mode — not what this is for
+
+        try:
+            _extract_all_tables(grid, path.name)
+        except ValueError as exc:
+            out.append({
+                "path": path,
+                "grid": grid,
+                "grid_excerpt": grid[:_SCHEMA_EXCERPT_ROWS],
+                "error": str(exc),
+            })
+    return out

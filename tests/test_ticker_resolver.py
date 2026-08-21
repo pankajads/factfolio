@@ -178,3 +178,32 @@ class TestResolveNamesPlumbing:
 
         with pytest.raises(Exception):  # noqa: B017
             anyio.run(ticker_resolver.resolve_names, [{"name": "A", "quantity": 1, "avg_cost": 1}])
+
+    def test_candidate_symbol_and_row_data_survive_onto_every_result(self, monkeypatch):
+        """candidate_symbol and row_data (see importers.py's discover_
+        unmapped_full_names) are INPUT fields, not something the agent's
+        own JSON output carries — resolve_names must carry both onto the
+        result regardless of whether the agent resolved that holding,
+        dropped it from its response, or (in this fake setup) never got
+        backed by real evidence at all. A caller's interactive fallback
+        (cli.py's _confirm_unmapped) depends on both still being there in
+        exactly the cases where the agent came back empty."""
+        monkeypatch.setattr(
+            ticker_resolver, "query",
+            self._fake_query_returning('[{"name": "A", "symbol": "A.NS", "confidence": "high"}]'),
+        )
+
+        holdings = [
+            {
+                "name": "A", "quantity": 1, "avg_cost": 1, "candidate_symbol": "ACORP",
+                "row_data": {"Scrip Code": "A CORP LTD", "Code": "ACORP"},
+            },
+            {"name": "B", "quantity": 2, "avg_cost": 2},  # no hint, dropped by the agent too
+        ]
+        resolved = anyio.run(ticker_resolver.resolve_names, holdings)
+
+        by_name = {r.name: r for r in resolved}
+        assert by_name["A"].row_data == {"Scrip Code": "A CORP LTD", "Code": "ACORP"}
+        assert by_name["B"].row_data is None
+        assert by_name["A"].candidate_symbol == "ACORP"
+        assert by_name["B"].candidate_symbol is None

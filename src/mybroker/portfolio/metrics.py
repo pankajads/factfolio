@@ -151,11 +151,40 @@ def snapshot(portfolio: Portfolio) -> PortfolioSnapshot:
         bucket_pairs.append((p.bucket, p.current_value))
         tier_pairs.append((p.tier, p.current_value))
 
+    # A direct-plan investor's statement never carries an AMFI code at all
+    # (there's no distributor/broker to populate one) — folio number is
+    # the only thing that actually is unique per real holding, and the
+    # SAME scheme name can legitimately appear more than once under
+    # different folios (a second lot bought through a different route,
+    # say). Counted up front so the disambiguation below only kicks in on
+    # an actual collision — the common case (each scheme appears once)
+    # stays exactly as readable as a bare scheme name.
+    mf_name_counts: dict[str, int] = {}
     for m in portfolio.mutual_funds:
+        mf_name_counts[m.scheme_name] = mf_name_counts.get(m.scheme_name, 0) + 1
+
+    for m in portfolio.mutual_funds:
+        # Always the readable scheme name, never amfi_code — unlike
+        # equity, where key (a real ticker) IS the natural thing to show
+        # in a "Symbol" column, an MF's amfi_code is an opaque registry
+        # number nobody recognises on sight, and — for at least one real
+        # broker's export — isn't even reliably a genuine AMFI code to
+        # begin with (its own internal "Scheme Code"/BSE token, which
+        # _MF_COL_KEYWORDS's looser fallback keywords can pick up too).
+        # Folio is what actually disambiguates two rows that would
+        # otherwise share this exact label — appended only when the name
+        # alone is genuinely ambiguous, not on every row.
+        label = m.scheme_name
+        if mf_name_counts[m.scheme_name] > 1 and m.folio:
+            label = f"{m.scheme_name} (Folio {m.folio})"
         positions.append(
             Weight(
-                key=m.amfi_code or m.scheme_name,
-                label=m.scheme_name,
+                # Nothing downstream keys MF positions by this field (see
+                # policy.py's speculative-symbol check and tools/server.py's
+                # lot lookup — both are equity-only), so there's no
+                # correctness reason for key to differ from label here.
+                key=label,
+                label=label,
                 value=m.current_value,
                 weight_pct=(m.current_value / total * 100) if total else 0.0,
                 sector="Mutual Funds",

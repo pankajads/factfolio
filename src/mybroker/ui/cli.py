@@ -16,6 +16,7 @@ from typing import Any
 import anyio
 import yaml
 from rich.console import Console
+from rich.markdown import Markdown
 from rich.table import Table
 
 from mybroker.config import REPORTS_DIR, ensure_dirs
@@ -376,11 +377,49 @@ def cmd_status(_args) -> int:
     return 0
 
 
+def _extract_section(report: str, heading: str) -> str | None:
+    """Pull the prose under a `## <heading>` line, up to the next `## `
+    heading or end of report. Used to surface the report's own "Bottom
+    line" — the 3-4 sentence answer to "what do I do with this" that the
+    orchestrator's system prompt already requires every report to open
+    with — in the terminal by default, instead of leaving it buried in the
+    saved .md file where only `--show` (or opening the file by hand) would
+    reveal it. Returns None if the heading isn't found, so callers can fall
+    back gracefully instead of assuming every report is shaped exactly as
+    asked."""
+    import re
+
+    pattern = re.compile(rf"^##\s+{re.escape(heading)}\s*$", re.IGNORECASE)
+    lines = report.splitlines()
+    start = next((i + 1 for i, line in enumerate(lines) if pattern.match(line.strip())), None)
+    if start is None:
+        return None
+    end = next((j for j in range(start, len(lines)) if lines[j].startswith("## ")), len(lines))
+    section = "\n".join(lines[start:end]).strip()
+    return section or None
+
+
 def _render_recommendations(recs: list) -> None:
-    """One row per recommendation actually logged this run — the real
-    BUY/SELL/HOLD decision and why, not a wall of markdown to scroll
-    through to find it. The full report (with everything else the agents
-    found) is still written to reports/ either way."""
+    """The real BUY/SELL/HOLD decisions logged this run — a compact table
+    for the at-a-glance list, then each one's full reasoning printed as
+    normal wrapped prose underneath, not a wall of markdown to scroll
+    through to find it.
+
+    Rationale and evidence used to live as extra table columns instead —
+    squeezed to ~50 and ~34 characters wide, which read fine when the
+    terminal was wide enough to give a table five columns' worth of room,
+    but on an ordinary terminal width, Rich had to shrink those columns
+    further to make the row fit at all: the rationale wrapped one or two
+    words per line for paragraphs long enough to need "Independently
+    re-checked" and "Tax consequence" sub-sections, and evidence got
+    ellipsis-truncated mid-token ("get_portfolio_snapshot.weight_pct…") —
+    a real user's own transcript showed both happening at once. A table
+    cell's width is fixed by the table; a paragraph printed on its own
+    just wraps at the full console width, the same as `status`'s own
+    output, which is what actually makes a multi-paragraph rationale
+    readable. The full report (with everything else the agents found) is
+    still written to reports/ either way.
+    """
     if not recs:
         console.print("[dim]No recommendations were logged this run.[/dim]")
         return
@@ -389,19 +428,26 @@ def _render_recommendations(recs: list) -> None:
     table.add_column("Symbol", style="bold", no_wrap=True)
     table.add_column("Action", no_wrap=True)
     table.add_column("Conviction", no_wrap=True)
-    table.add_column("Rationale", max_width=56)
-    table.add_column("Key evidence", max_width=34, style="dim")
 
     for r in recs:
         style = _ACTION_STYLE.get(r.action, "")
         action = f"[{style}]{r.action}[/{style}]" if style else r.action
-        evidence = "\n".join(
-            f"{e.get('tool', '?')}.{e.get('field', '?')}={e.get('value', '?')}"
-            for e in (r.evidence or [])[:3]
-        )
-        table.add_row(r.symbol, action, r.conviction, r.rationale, evidence)
+        table.add_row(r.symbol, action, r.conviction)
 
     console.print(table)
+
+    for r in recs:
+        style = _ACTION_STYLE.get(r.action, "")
+        action = f"[{style}]{r.action}[/{style}]" if style else r.action
+        console.print()
+        console.print(f"[bold]{r.symbol}[/bold] — {action} [dim]({r.conviction} conviction)[/dim]")
+        console.print(r.rationale)
+        if r.evidence:
+            evidence = "  ·  ".join(
+                f"{e.get('tool', '?')}.{e.get('field', '?')}={e.get('value', '?')}"
+                for e in r.evidence[:3]
+            )
+            console.print(f"[dim]Evidence: {evidence}[/dim]")
 
 
 def cmd_report(args) -> int:
@@ -411,6 +457,16 @@ def cmd_report(args) -> int:
 
     ensure_dirs()
     err_console.print(_auth_status_line())
+    # Set upfront, not discovered after the fact: this dispatches a roster of
+    # subagents across the whole portfolio, so it's minutes and real API
+    # spend, not a `status`-style instant snapshot. A first run with no
+    # warning either reads as hung or lands as a surprise bill — either way,
+    # a bad first impression that one line fixes.
+    err_console.print(
+        "[dim]Full review: dispatches a team of subagents across your whole "
+        "portfolio — typically 10-15 min and a few dollars of API usage "
+        "(varies with portfolio size). Ctrl-C to cancel.[/dim]"
+    )
 
     # A multi-minute silent wait reads as "did this hang?" — the live status
     # line (driven by run_review's on_event callback, one update per tool
@@ -443,8 +499,30 @@ def cmd_report(args) -> int:
         + (f" · ${result.cost_usd:.4f}" if result.cost_usd else "") + "[/dim]"
     )
 
+    # The report's own "Bottom line" section (mandatory per the orchestrator's
+    # system prompt) is written to BE the answer to "so what do I do" — a
+    # reader who stops there should still get the decision. Printing only
+    # the raw recommendations table by default buried that answer inside the
+    # saved .md file, behind --show, which is exactly why that table alone
+    # reads as "not sure what the recommendation is": the table is the
+    # evidence, this is the verdict, and the verdict was never shown.
+    bottom_line = _extract_section(result.report, "Bottom line")
+    if bottom_line:
+        console.print()
+        console.print("[bold]Bottom line[/bold]")
+        console.print(Markdown(bottom_line))
+
+    recs = recommendations_for_run(result.run_id)
     console.print()
-    _render_recommendations(recommendations_for_run(result.run_id))
+    _render_recommendations(recs)
+
+    if recs:
+        console.print(
+            "\n[dim]Every BUY/SELL/TRIM above was independently challenged by "
+            "a second, adversarial pass before being logged — the full "
+            f"reasoning trail (including anything that got revised as a "
+            f"result) is in {out}.[/dim]"
+        )
 
     if args.show:
         console.print()
@@ -621,28 +699,6 @@ def cmd_init(_args) -> int:
 _MAX_SUGGESTIONS = 15
 
 
-def _collect_unmapped_holdings() -> list[dict]:
-    """Every full-name holding (name + quantity + avg_cost) across
-    holdings.csv and holdings_inbox/ that can't be auto-drafted — shared
-    by the M7 agent-assisted resolver and its plain-search fallback."""
-    from mybroker.config import HOLDINGS_EQUITY, HOLDINGS_INBOX_DIR
-    from mybroker.portfolio.importers import discover_inbox_files, discover_unmapped_full_names
-
-    sources = []
-    if HOLDINGS_EQUITY.exists():
-        sources.append(HOLDINGS_EQUITY)
-    sources.extend(discover_inbox_files(HOLDINGS_INBOX_DIR))
-
-    holdings: list[dict] = []
-    seen: set[str] = set()
-    for file in sources:
-        for h in discover_unmapped_full_names(file):
-            if h["name"] not in seen:
-                seen.add(h["name"])
-                holdings.append(h)
-    return holdings
-
-
 def _suggest_ticker_matches() -> None:
     """For every full-company-name holding that can't be auto-drafted (see
     importers.discover_unmapped_full_names — a Sharekhan-style "Scrip
@@ -658,7 +714,7 @@ def _suggest_ticker_matches() -> None:
     — no `claude` login, network, a malformed response — since this is
     convenience end to end, never a gate that could block `init`.
     """
-    holdings = _collect_unmapped_holdings()
+    holdings = ticker_seeding.collect_unmapped_holdings()
     if not holdings:
         return
 
@@ -683,6 +739,30 @@ def _suggest_ticker_matches() -> None:
             len(todo), type(exc).__name__, exc,
         )
         _suggest_via_plain_search(todo, skipped)
+
+
+_REASON_LIMIT = 140
+
+
+def _short_reason(text: str, symbol: str = "") -> str:
+    """The resolver's own prompt now asks for one short sentence (see
+    ticker_resolver.py), but a model can still ignore that — this is the
+    code-level backstop, same "prompt asks, code enforces" split as the
+    duplicate-tracking above. A wall of reasoning text mid-`init`, before a
+    new user has seen the product do anything useful yet, reads as "this is
+    going to be a lot of work" — exactly the wrong first impression. Nothing
+    is lost: the full text still goes to the log for whoever later wants to
+    know why a symbol didn't resolve."""
+    text = (text or "").strip()
+    if len(text) <= _REASON_LIMIT:
+        return text or "no confident match found"
+
+    from mybroker.logging_setup import get_logger
+
+    get_logger(__name__).info(
+        "Full ticker-resolution reasoning for %s: %s", symbol or "?", text
+    )
+    return text[:_REASON_LIMIT].rstrip() + "… (see logs/ for the full reasoning)"
 
 
 def _resolve_via_agent(todo: list[dict], skipped: int) -> None:
@@ -715,7 +795,8 @@ def _resolve_via_agent(todo: list[dict], skipped: int) -> None:
                 continue
         if key in written_this_run and r.symbol and not r.duplicate_of:
             print(f"  {YELLOW}?{RESET} {r.name!r} — {r.symbol} was already added this "
-                  f"run (likely the same holding as another row): {r.reasoning}")
+                  f"run (likely the same holding as another row): "
+                  f"{_short_reason(r.reasoning, r.name)}")
         elif (
             key in pre_existing_keys and r.symbol and not r.duplicate_of
             and r.confidence == "high"
@@ -729,43 +810,106 @@ def _resolve_via_agent(todo: list[dict], skipped: int) -> None:
             # unlike a fresh entry, nothing about candidates/tier/bucket
             # changes, so there's no new guess being made here.
             ticker_seeding.backfill_draft_entry(
-                config.TICKERS_FILE, key, name=r.company_name or r.name, sector=r.sector
+                config.TICKERS_FILE, key, name=r.company_name or r.name,
+                sector=r.sector, alias=r.name,
             )
             print(f"  {GREEN}✓{RESET} {r.name!r} → {BOLD}{key}{RESET} "
                   f"{DIM}— existing DRAFT entry, backfilled its name/sector{RESET}")
         elif key in pre_existing_keys and r.symbol and not r.duplicate_of:
             print(f"  {YELLOW}?{RESET} {r.name!r} — {r.symbol} is already in tickers.yaml "
-                  f"(check it covers this holding too): {r.reasoning}")
+                  f"(check it covers this holding too): {_short_reason(r.reasoning, r.name)}")
+            # Same accept/edit/skip offer as the plain-uncertain-match case
+            # below — a demerger (Tata Motors → TMCV/TMPV, say) means the
+            # agent's own suggested symbol legitimately already existing in
+            # tickers.yaml does NOT mean this holding is covered by it; a
+            # human needs to say whether it's the same holding or a genuinely
+            # separate one that needs its own entry.
+            if sys.stdin.isatty():
+                result = _confirm_uncertain_match(r)
+                if result:
+                    chosen, confirmed = result
+                    _write_reviewed_symbol(
+                        r, chosen, confirmed=confirmed,
+                        pre_existing_keys=pre_existing_keys,
+                        written_this_run=written_this_run,
+                    )
         elif r.duplicate_of:
             print(f"  {YELLOW}?{RESET} {r.name!r} — looks like the same holding as "
-                  f"{r.duplicate_of!r}: {r.reasoning}")
+                  f"{r.duplicate_of!r}: {_short_reason(r.reasoning, r.name)}")
         elif r.symbol:
             print(f"  {YELLOW}?{RESET} {r.name!r} — possible match {BOLD}{r.symbol}{RESET} "
-                  f"({r.confidence} confidence): {r.reasoning}")
+                  f"({r.confidence} confidence): {_short_reason(r.reasoning, r.name)}")
             # Only ever offered interactively — a scripted/non-interactive
             # run (a frozen build piped in CI, say) keeps the old behaviour
             # of just printing the line above and moving on.
             if sys.stdin.isatty():
-                chosen = _confirm_uncertain_match(r)
-                if chosen:
-                    chosen_key = chosen.split(".")[0]
-                    if chosen_key in pre_existing_keys or chosen_key in written_this_run:
-                        print(f"    {YELLOW}!{RESET} {chosen_key} is already in "
-                              f"tickers.yaml — not overwriting it; edit that entry "
-                              f"yourself if it needs to change.")
-                    else:
-                        block = _reviewed_entry(r, chosen, edited=chosen != r.symbol)
-                        if _insert_ticker_yaml_block(config.TICKERS_FILE, block):
-                            written_this_run.add(chosen_key)
-                            print(f"    {GREEN}✓{RESET} added {BOLD}{chosen}{RESET} to "
-                                  f"tickers.yaml — still review tier/bucket")
+                result = _confirm_uncertain_match(r)
+                if result:
+                    chosen, confirmed = result
+                    _write_reviewed_symbol(
+                        r, chosen, confirmed=confirmed,
+                        pre_existing_keys=pre_existing_keys,
+                        written_this_run=written_this_run,
+                    )
         else:
-            print(f"  {YELLOW}?{RESET} {r.name!r} — "
-                  f"{r.reasoning or 'no confident match found'}")
+            hint = (
+                f" {DIM}(candidate from elsewhere in the same row: "
+                f"{RESET}{BOLD}{r.candidate_symbol}{RESET}{DIM} — unverified, "
+                f"your call){RESET}"
+                if r.candidate_symbol else ""
+            )
+            print(f"  {YELLOW}?{RESET} {r.name!r} — {_short_reason(r.reasoning, r.name)}{hint}")
+            # The agent found nothing trustworthy at all (zero search
+            # candidates, or a claimed symbol that failed grounding) — the
+            # accept/edit prompt above doesn't apply by default. But two
+            # real options remain: r.candidate_symbol (a short code found
+            # elsewhere in the SAME source row — see importers.py's
+            # discover_unmapped_full_names; the agent's own SYSTEM_PROMPT
+            # tells it to search this first, but that's a prompt
+            # instruction, not code-enforced, so it's shown here as
+            # unverified either way, not as "already tried and failed")
+            # can still be accepted on a human's own judgment; and the
+            # SOURCE NAME is often the actual problem — a demat PDF's text
+            # extraction routinely mangles names ("HINDUSTA N COPPER LTD"
+            # for "Hindustan Copper Ltd" — a stray mid-word space, not a
+            # real company) — so fixing it and retrying is a real third
+            # option, not just typing a symbol blind.
+            if sys.stdin.isatty():
+                result = _confirm_unmapped(r)
+                if result:
+                    chosen, confirmed = result
+                    _write_reviewed_symbol(
+                        r, chosen, confirmed=confirmed,
+                        pre_existing_keys=pre_existing_keys,
+                        written_this_run=written_this_run,
+                    )
+
+    # Same reason as cmd_init's own cache_clear after seed_draft_ticker_
+    # entries: load_tickers() is cached, and every write above (a new entry
+    # via written_this_run.add(), OR a backfilled name/sector on an existing
+    # draft — which never touches written_this_run) makes that cache stale.
+    # Unconditional on purpose, not gated on written_this_run being
+    # non-empty: a backfill-only run (nothing new, only existing DRAFT
+    # entries getting their name filled in) writes to disk too. Missing
+    # this was the actual bug behind "validate resolved 5 holdings, then
+    # said all 11 were still unmapped, in the SAME run" — cmd_validate's
+    # re-validate call right after this function returns read the
+    # pre-resolution snapshot straight out of the cache, never touching what
+    # was just written to disk. The old two-process workflow (init, then a
+    # separately invoked validate) never hit this: a fresh process starts
+    # with an empty cache regardless.
+    config.load_tickers.cache_clear()
 
     if skipped:
         print(f"  {DIM}…and {skipped} more — re-run init after adding some of "
               f"these to see the rest.{RESET}")
+
+
+def _alias_yaml(name: str) -> str:
+    """A single-item flow-style YAML list for an `aliases:` line, quoted
+    only when the raw text actually needs it (colons, leading punctuation,
+    ...) — safe_dump already knows the rule, no need to hand-roll it."""
+    return yaml.safe_dump([name], default_flow_style=True).strip()
 
 
 def _agent_resolved_entry(r) -> str:
@@ -775,7 +919,16 @@ def _agent_resolved_entry(r) -> str:
     bare guess — so, unlike a plain DRAFT, only the single verified
     candidate is listed, never padded out with an unverified .BO/.NS
     guess alongside it. tier/bucket still can't come from any market-data
-    source, so those stay your own call either way."""
+    source, so those stay your own call either way.
+
+    aliases: records r.name (the RAW source text, before any cleanup)
+    verbatim — see config.py's resolve_symbol_by_name for why: a source
+    file's own PDF-wrapping or abbreviations routinely make the raw name
+    normalize to something the clean `name:` field never will, so without
+    this, the exact same holding gets re-flagged as "still unmapped" the
+    very next time this file is re-scanned, even though it was already
+    correctly resolved moments ago.
+    """
     return (
         f"  {r.symbol.split('.')[0]}:\n"
         f"    name: {r.company_name or r.name}\n"
@@ -783,6 +936,7 @@ def _agent_resolved_entry(r) -> str:
         f"    sector: {r.sector or 'Unknown'}\n"
         f"    tier: unknown  # TODO: large | mid | small\n"
         f"    bucket: satellite  # TODO: core | satellite\n"
+        f"    aliases: {_alias_yaml(r.name)}  # raw source text this was resolved from\n"
         f"    notes: >\n"
         f"      Resolved by the factfolio init agent from {r.name!r}, high confidence.\n"
         f"      tier/bucket still need your own judgment either way — nothing\n"
@@ -791,14 +945,31 @@ def _agent_resolved_entry(r) -> str:
     )
 
 
-def _confirm_uncertain_match(r) -> str | None:
+def _prompt_symbol(hint: str = "e.g. TCS.NS") -> str | None:
+    """Raw 'type a symbol, blank to skip' prompt shared by every interactive
+    resolution path below. Returns None on EOF/Ctrl-C/blank input — always
+    treated as skip, never as an error."""
+    try:
+        typed = input(f"    Symbol ({hint}), blank to skip: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+    return typed or None
+
+
+def _confirm_uncertain_match(r) -> tuple[str, bool] | None:
     """Interactive-only follow-up to a printed medium/low-confidence '?'
     line: let a human accept the agent's own suggested symbol, type a
     different one, or skip — right here, instead of leaving it as a line
     in scrollback that's easy to miss and forces a separate trip to a text
-    editor to fix. Returns the symbol to write (accepted or edited), or
-    None to leave this holding unmapped, same as before. Never called
-    outside an interactive terminal — see its call site.
+    editor to fix. Returns (symbol, confirmed) to write, or None to leave
+    this holding unmapped, same as before. `confirmed` is True only for
+    "accept" — the agent's own suggestion, grounded in a real search for
+    THIS holding — never for a hand-typed symbol, which might just be a
+    typo that happens to collide with something unrelated already in
+    tickers.yaml (see _write_reviewed_symbol for what that distinction
+    controls). Never called outside an interactive terminal — see its
+    call site.
     """
     try:
         answer = input(
@@ -809,15 +980,204 @@ def _confirm_uncertain_match(r) -> str | None:
         return None
 
     if answer.startswith("a"):
-        return r.symbol
+        return r.symbol, True
     if answer.startswith("e"):
+        typed = _prompt_symbol()
+        return (typed, False) if typed else None
+    return None
+
+
+def _print_row_data(r) -> None:
+    """The full source row (see importers.py's discover_unmapped_full_names)
+    behind an unresolved holding — every column, raw, under its own real
+    header label. Printed on request from _confirm_unmapped rather than
+    always, so the common case (accept/type/skip) isn't buried under a
+    dozen lines most of the time — but available in full for exactly the
+    case a fixed heuristic and an agent's own read both missed: a person
+    looking at the actual statement, the same material either of them had,
+    often spots it in a second."""
+    if not r.row_data:
+        print(f"    {DIM}No row data available for this holding.{RESET}")
+        return
+    width = max(len(k) for k in r.row_data)
+    for key, value in r.row_data.items():
+        print(f"    {DIM}{key:<{width}}{RESET}  {value}")
+
+
+def _confirm_unmapped(r) -> tuple[str, bool] | None:
+    """Interactive-only follow-up when the agent found nothing trustworthy
+    at all — zero search candidates, or a claimed symbol that failed
+    grounding (agents/ticker_resolver.py's _validate). Unlike
+    _confirm_uncertain_match, there's no AGENT-verified suggestion to
+    accept — but r.candidate_symbol (a short code found elsewhere in the
+    same source row) is still worth offering as a one-keystroke accept: a
+    human recognising "oh, that's obviously the right one" from the same
+    statement row is a real, fast option, even though nothing here
+    independently verified it. r.row_data — the WHOLE row, not just that
+    one heuristic guess — is offered too, on request: the actual fix for
+    "don't just trust a fixed set of Python assumptions" is giving a human
+    the same raw material an intelligent reader (the agent, or a person)
+    needs to actually understand the file, not a narrower pre-filtered
+    guess. Beyond that, the SOURCE NAME is often itself the problem — a
+    demat PDF's text extraction routinely mangles names ("HINDUSTA N
+    COPPER LTD" for "Hindustan Copper Ltd", a stray mid-word space), which
+    is exactly the kind of thing that makes a real company's search come
+    back empty. Correcting the name and retrying a plain search (no new
+    agent call — same deterministic yfinance lookup the no-agent fallback
+    path already uses) turns that from "give up" into "actually resolves."
+
+    Returns (symbol, confirmed) or None — `confirmed` is True for the two
+    paths grounded in real evidence about THIS holding (the same-row
+    candidate_symbol, or a deterministic search on a human-corrected
+    name), False for a hand-typed symbol with nothing behind it but a
+    guess. See _write_reviewed_symbol for what that distinction controls.
+    """
+    while True:
+        parts = []
+        if r.candidate_symbol:
+            parts.append(f"[a]ccept {r.candidate_symbol} (unverified, from the same row)")
+        parts.append("[t]ype a different symbol" if r.candidate_symbol else "[t]ype the symbol yourself")
+        parts.append("[c]orrect the company name and retry search")
+        if r.row_data:
+            parts.append("[r]ow data")
+        parts.append("[s]kip")
+        letters = "/".join(p[1] for p in parts[:-1]) + "/S"
         try:
-            typed = input("    Symbol (e.g. TCS.NS), blank to skip: ").strip()
+            answer = input(f"    {', '.join(parts)}? [{letters}] ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             print()
             return None
-        return typed or None
+
+        if r.candidate_symbol and answer.startswith("a"):
+            # Unlike r.symbol on the _confirm_uncertain_match path (always
+            # a real yfinance result, already exchange-suffixed),
+            # candidate_symbol comes straight from the source file's own
+            # text and never carries a .NS/.BO suffix — writing it bare
+            # would silently produce an entry `factfolio validate` can
+            # never resolve. NSE-first is the same default preference used
+            # everywhere else here (the resolver's own instructions,
+            # draft_ticker_entry's [.NS, .BO] guess order); validate's own
+            # probe is still what actually confirms it, same as every
+            # other guessed candidate.
+            symbol = (
+                r.candidate_symbol if "." in r.candidate_symbol
+                else f"{r.candidate_symbol}.NS"
+            )
+            return symbol, True
+
+        if r.row_data and answer.startswith("r"):
+            _print_row_data(r)
+            continue
+
+        break
+
+    if answer.startswith("t"):
+        typed = _prompt_symbol()
+        return (typed, False) if typed else None
+
+    if answer.startswith("c"):
+        try:
+            corrected = input(
+                f"    Correct company name (was {r.name!r}), blank to skip: "
+            ).strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        if not corrected:
+            return None
+
+        from mybroker.config import suggest_ticker_for_name
+
+        suggestion = suggest_ticker_for_name(corrected)
+        if not suggestion:
+            print(f"    {DIM}No match found for {corrected!r} either.{RESET}")
+            return None
+
+        print(f"    {DIM}Found{RESET} {BOLD}{suggestion}{RESET} {DIM}for "
+              f"{corrected!r}.{RESET}")
+        try:
+            confirm = input(
+                f"    [a]ccept {suggestion}, [e]dit, [s]kip? [a/e/S] "
+            ).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        if confirm.startswith("a"):
+            return suggestion, True
+        if confirm.startswith("e"):
+            typed = _prompt_symbol()
+            return (typed, False) if typed else None
+        return None
+
     return None
+
+
+def _write_reviewed_symbol(
+    r, chosen: str, *, confirmed: bool, pre_existing_keys: set[str],
+    written_this_run: set[str],
+) -> None:
+    """Write a human-confirmed-or-typed symbol to tickers.yaml.
+
+    If `chosen` already has an entry from BEFORE this run AND `confirmed`
+    is True — the symbol came from real evidence about THIS holding
+    (accepting the agent's own suggestion, or its same-row
+    candidate_symbol, or a deterministic search on a human-corrected
+    name), not a blind guess — there's no new entry to insert, but the
+    confirmation itself still needs to go somewhere durable. Without
+    this, accepting such a match used to just print "already in
+    tickers.yaml — not overwriting it" and throw the confirmation away,
+    which meant the exact same holding got flagged as unmapped again on
+    the very next `factfolio validate`, forever, with no way to actually
+    close it out (the real bug behind a Tata Steel demat-PDF entry that
+    could never be accepted). Now: a pristine (never-touched) draft gets
+    its name/sector backfilled the same way the automatic
+    high-confidence path does; anything else gets r.name recorded as an
+    alias (ticker_seeding.add_alias_to_entry) so
+    config.resolve_symbol_by_name matches it outright next time.
+
+    `confirmed=False` (a hand-typed symbol at the [e]dit prompt, with
+    nothing behind it but a guess) keeps the old hands-off behaviour even
+    on a collision — it might just be a typo that happens to match an
+    unrelated existing entry, and silently aliasing onto it would
+    conflate two different holdings. Same for a symbol written earlier in
+    THIS same run (written_this_run) — two different holdings resolving
+    to the same brand-new symbol in one pass, genuinely ambiguous either
+    way.
+
+    Shared by every interactive prompt above so this stays one rule, not
+    several that could drift.
+    """
+    from mybroker import config
+
+    chosen_key = chosen.split(".")[0]
+    if chosen_key in written_this_run:
+        print(f"    {YELLOW}!{RESET} {chosen_key} was already added this run — "
+              f"not overwriting it; edit that entry yourself if it needs to change.")
+        return
+    if chosen_key in pre_existing_keys and not confirmed:
+        print(f"    {YELLOW}!{RESET} {chosen_key} is already in tickers.yaml — "
+              f"not overwriting it; edit that entry yourself if it needs to change.")
+        return
+    if chosen_key in pre_existing_keys:
+        if ticker_seeding.is_pristine_draft(config.TICKERS_FILE, chosen_key):
+            ticker_seeding.backfill_draft_entry(
+                config.TICKERS_FILE, chosen_key, name=r.company_name or r.name,
+                sector=r.sector, alias=r.name,
+            )
+            print(f"    {GREEN}✓{RESET} {r.name!r} → existing {BOLD}{chosen_key}{RESET} "
+                  f"entry — backfilled its name/sector and recorded as an alias")
+        elif ticker_seeding.add_alias_to_entry(config.TICKERS_FILE, chosen_key, r.name):
+            print(f"    {GREEN}✓{RESET} {r.name!r} recorded as another name for the "
+                  f"existing {BOLD}{chosen_key}{RESET} entry")
+        else:
+            print(f"    {YELLOW}!{RESET} {chosen_key} is already in tickers.yaml — "
+                  f"couldn't attach an alias to it; edit that entry yourself.")
+        return
+    block = _reviewed_entry(r, chosen, edited=chosen != r.symbol)
+    if _insert_ticker_yaml_block(config.TICKERS_FILE, block):
+        written_this_run.add(chosen_key)
+        print(f"    {GREEN}✓{RESET} added {BOLD}{chosen}{RESET} to tickers.yaml "
+              f"— still review tier/bucket")
 
 
 def _reviewed_entry(r, symbol: str, *, edited: bool) -> str:
@@ -851,6 +1211,7 @@ def _reviewed_entry(r, symbol: str, *, edited: bool) -> str:
         f"    sector: {sector}\n"
         f"    tier: unknown  # TODO: large | mid | small\n"
         f"    bucket: satellite  # TODO: core | satellite\n"
+        f"    aliases: {_alias_yaml(r.name)}  # raw source text this was resolved from\n"
         f"    notes: >\n"
         f"      {note}\n"
     )
@@ -910,8 +1271,14 @@ def _print_getting_started(target: Path, tickers_file: Path) -> None:
     print("       equity or mutual fund, any filename — each file is sniffed "
           "and classified automatically")
 
-    print(f"\n{BOLD}3. Map every symbol you hold{RESET} in {tickers_file}")
-    print("     an unmapped symbol is a hard error on purpose — no silent .NS guessing")
+    print(f"\n{BOLD}3. Run{RESET} factfolio validate")
+    print("     it drafts and resolves what it can on its own, and offers "
+          "AI-assisted lookup")
+    print("     for anything left (a full company name with no ticker, say) — "
+          "an unmapped symbol")
+    print("     is a hard error on purpose, never a silent .NS guess, but you "
+          "shouldn't need to")
+    print(f"     hand-edit {tickers_file} yourself unless you want to")
 
     print(f"\n{BOLD}4. Set your real numbers{RESET} in "
           f"{target / 'memory' / 'investment_policy.md'}")
@@ -930,20 +1297,206 @@ def _print_getting_started(target: Path, tickers_file: Path) -> None:
     print(f"  factfolio mcp         {DIM}run as an MCP server for other tools{RESET}")
     print(f"  factfolio --help      {DIM}everything{RESET}")
 
-    print(f"\n{BOLD}The LLM, in short:{RESET} only `report`, `chat`, and mcp's "
+    print(f"\n{BOLD}The LLM, in short:{RESET} `report`, `chat`, `init`, and mcp's "
           f"run_portfolio_review call one —")
     print("  your local `claude login` session by default, or export "
           "ANTHROPIC_API_KEY to override.")
-    print("  status/validate/cron/estimate-dates are pure deterministic Python, "
-          "no LLM involved.")
+    print("  `validate` is pure deterministic Python by default, no LLM — it "
+          "only ever asks to call")
+    print("  one, interactively, if it finds a holding it can't map, or a "
+          "holdings file it can't read,")
+    print("  any other way. status/cron/estimate-dates never do.")
     print("  Either way, your holdings and their values never leave this machine.")
 
 
+def _print_mf_summary() -> None:
+    """One line of confirmation that mutual-fund holdings were found and
+    valued, printed at the end of `factfolio validate` regardless of
+    outcome. `validate` genuinely never needed to touch them — there's no
+    yfinance ticker to resolve for a mutual fund the way there is for a
+    stock — but saying NOTHING about them left a real user unable to tell
+    "correctly parsed, just not this command's job" apart from "silently
+    dropped", with no signal at all pointing them toward `status`, which
+    is the only place they were ever going to show up.
+
+    Never lets a failure here block/crash validate — best-effort, exactly
+    like the AI-assisted offers above it.
+    """
+    try:
+        from mybroker.portfolio.loader import load_portfolio
+
+        portfolio = load_portfolio()
+    except Exception:
+        return
+
+    if not portfolio.mutual_funds:
+        return
+
+    total = sum(m.current_value for m in portfolio.mutual_funds)
+    count = len(portfolio.mutual_funds)
+    plural = "" if count == 1 else "s"
+    print(f"\n{BOLD}Mutual funds{RESET}")
+    print(f"  {GREEN}✓{RESET} {count} holding{plural} found "
+          f"(₹{total:,.0f} current value) — `factfolio validate` doesn't "
+          f"resolve these (no ticker to look up); run {BOLD}factfolio "
+          f"status{RESET} to see them.")
+
+
+def _offer_schema_resolution(unresolvable: list[dict]) -> None:
+    """Interactive-only: a holdings_inbox file the deterministic path
+    couldn't parse at all — no recognisable header row by keyword, or a
+    header it found but whose required columns it couldn't resolve. Both
+    are handed to the AI resolver the same way (see portfolio/importers
+    .py's module docstring for why this exists instead of another
+    hand-tuned heuristic): it isn't told where the header is any more
+    than a human opening the file would be — finding it is part of what
+    it's asked to do, so this isn't limited to only the narrower of the
+    two failure modes. Its proposal is verified against the file's OWN
+    data (validate_schema) before it's trusted, and written to the
+    durable column-map cache only once it passes, so the SAME format is
+    recognised instantly in any future file, no code change and no
+    re-asking required. Never called outside an interactive terminal —
+    see cmd_validate's own docstring on why `validate` must stay
+    deterministic-by-default regardless.
+    """
+    from mybroker.portfolio.importers import save_column_map, validate_schema
+
+    for item in unresolvable:
+        path = item["path"]
+        print(f"\n{YELLOW}!{RESET} {path.name}: {item['error']}")
+        try:
+            answer = input(
+                "    Ask an AI agent to read this file and figure out its "
+                "structure? [Y/n] "
+            ).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if answer.startswith("n"):
+            continue
+
+        print(f"    {_auth_status_line()}")
+        try:
+            from mybroker.agents.schema_resolver import resolve_schema
+
+            schema = anyio.run(resolve_schema, item["grid_excerpt"])
+        except Exception as exc:
+            from mybroker.logging_setup import get_logger
+
+            get_logger(__name__).warning(
+                "Schema resolution failed for %s (%s: %s) — leaving it "
+                "unparseable.", path.name, type(exc).__name__, exc,
+            )
+            print(f"    {RED}✗{RESET} Couldn't resolve it: {exc}")
+            continue
+
+        if schema.header_row is None or schema.kind is None:
+            print(f"    {RED}✗{RESET} The agent couldn't find a holdings "
+                  f"table in this file at all.")
+            if schema.reasoning:
+                print(f"    {DIM}Its reasoning: {schema.reasoning}{RESET}")
+            continue
+
+        ok, problems = validate_schema(
+            schema.kind, schema.columns, item["grid"], schema.header_row
+        )
+        if not ok:
+            print(f"    {RED}✗{RESET} The agent's proposed mapping didn't "
+                  f"check out against the file's real data:")
+            for p in problems:
+                print(f"      - {p}")
+            if schema.reasoning:
+                print(f"    {DIM}Its reasoning: {schema.reasoning}{RESET}")
+            continue
+
+        header = item["grid"][schema.header_row]
+        print(f"    {GREEN}✓{RESET} Found the table at row "
+              f"{schema.header_row} — mapped as {BOLD}{schema.kind}{RESET} "
+              f"({schema.confidence} confidence)")
+        for field_name, col in schema.columns.items():
+            if col is not None:
+                print(f"      {field_name:<15} → column {col} ({header[col]!r})")
+        if schema.reasoning:
+            print(f"    {DIM}{schema.reasoning}{RESET}")
+
+        save_column_map(
+            header, kind=schema.kind, columns=schema.columns,
+            source=path.name, confidence=schema.confidence,
+            reasoning=schema.reasoning,
+        )
+        print(f"    {DIM}Learned for future files with this same header — "
+              f"see .cache/column_maps.json.{RESET}")
+
+
 def cmd_validate(_args) -> int:
-    """Re-resolve tickers. The gate that must pass before any agent run."""
+    """Re-resolve tickers. The gate that must pass before any agent run.
+
+    Previously, a holding that only carries a full company name (a demat
+    statement's "Scrip Name" column, say) needed a completely separate trip
+    back to `factfolio init` to get AI-resolved — `validate` on its own
+    could only fail and point at that command by name, never do anything
+    about it itself. That's the exact "duplicate work" a real user hit:
+    init once with no holdings yet, add holdings, validate (fails), init
+    again (only now does anything), validate again. This collapses that
+    down to one command: on a failure caused specifically by unmapped
+    full-name holdings, offer the same AI-assisted resolver right here —
+    interactively only, since `validate` is documented elsewhere (the
+    `init` summary, the README) as pure deterministic Python with no LLM
+    call, and that promise must stay true for anyone piping/scripting this
+    (a non-interactive run just gets today's exact behaviour: fail, name
+    what's missing, point at `factfolio init`).
+
+    Also offers AI-assisted schema (column) resolution for any
+    holdings_inbox file whose required columns couldn't be found at all —
+    a genuinely novel export format, not just an unmapped name — same
+    interactive-only, deterministic-by-default discipline. Run BEFORE the
+    ticker gate below: a file whose columns can't be read has nothing
+    valid to offer tickers.yaml in the first place.
+
+    Prints a mutual-fund summary before returning, on every exit path,
+    pass or fail: `validate` is specifically the EQUITY ticker-resolution
+    gate — a mutual fund doesn't need yfinance ticker resolution the way
+    a stock does, so it was never part of what this command checks — but
+    printing NOTHING about mutual funds here made it look, to a real
+    user, like they'd been silently dropped or ignored, when they were
+    actually read and valued correctly the entire time. This is a pointer
+    to where to actually see them (`factfolio status`), not a second pass
+    over their data.
+    """
+    from mybroker.portfolio.importers import find_unresolvable_files
     from mybroker.tickers_validate import main as validate_main
 
-    return validate_main()
+    def _finish(rc: int) -> int:
+        _print_mf_summary()
+        return rc
+
+    unresolvable = find_unresolvable_files()
+    if unresolvable and sys.stdin.isatty():
+        _offer_schema_resolution(unresolvable)
+
+    rc = validate_main()
+    if rc == 0:
+        return _finish(rc)
+
+    unmapped = ticker_seeding.collect_unmapped_holdings()
+    if not unmapped or not sys.stdin.isatty():
+        return _finish(rc)
+
+    print(f"\n{_auth_status_line()}")
+    try:
+        answer = input(
+            f"Resolve {len(unmapped)} of these now via AI-assisted lookup? [Y/n] "
+        ).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return _finish(rc)
+    if answer.startswith("n"):
+        return _finish(rc)
+
+    _suggest_ticker_matches()
+
+    print(f"\n{DIM}Re-running validate…{RESET}")
+    return _finish(validate_main())
 
 
 def cmd_mcp(_args) -> int:
@@ -1095,7 +1648,7 @@ def main(argv: list[str] | None = None) -> int:
     from mybroker import __version__
 
     parser = argparse.ArgumentParser(
-        prog="mybroker",
+        prog="factfolio",
         description="Indian equity & mutual fund portfolio advisory agent.",
     )
     parser.add_argument("--version", action="version", version=f"factfolio {__version__}")

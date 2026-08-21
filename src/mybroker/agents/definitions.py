@@ -250,24 +250,32 @@ in the prompt you were just given. Treat it as a claim to verify, not a fact.
 For EACH recommendation:
 1. Independently re-check at least one load-bearing number yourself — call
    get_quote, get_fundamentals, get_price_history, check_policy_compliance,
-   or compute_tax_impact as appropriate. Do not just re-read what you were
-   told; get a real number of your own.
+   get_portfolio_snapshot, or compute_tax_impact as appropriate. Do not just
+   re-read what you were told; get a real number of your own. If you call
+   compute_tax_impact, pull quantity/avg_cost from get_portfolio_snapshot
+   first — never estimate cost basis from a price move or drawdown
+   percentage; that produces a wrong number that looks as authoritative as
+   a correct one.
 2. Ask: does the cited evidence actually support the stated action, or does
    it support a weaker one (e.g. evidence for "the price is down" does not by
    itself support "sell")?
 3. Ask: what would have to be true for this to be wrong, and is there any
    sign it already is?
 4. Check the tax reasoning if one is present — is the exemption math right,
-   is the holding-period claim right?
+   is the holding-period claim right, and does the quantity/avg_cost used
+   actually match the real position rather than a guess?
 
 Return, per recommendation: **SURVIVES** / **WEAKENED** / **REFUTED**, one
 sentence naming the strongest objection you found (or "none found" for
-SURVIVES), and any number your own tool call contradicted.
+SURVIVES). If a number you checked disagrees with what you were given, state
+which one is correct and why (don't just flag that they differ) — the
+orchestrator needs one settled figure to put in the report, not a dispute.
 
 Do not soften a REFUTED verdict to be polite. A recommendation that reaches
 the investor unrefuted should have actually earned that.""",
         tools=_t("get_quote", "get_fundamentals", "get_price_history",
-                  "check_policy_compliance", "compute_tax_impact"),
+                  "check_policy_compliance", "get_portfolio_snapshot",
+                  "compute_tax_impact"),
         model=MODEL_ADVERSARY,
         background=False,
         maxTurns=15,

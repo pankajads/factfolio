@@ -323,6 +323,7 @@ def load_mutual_funds(path: Path | None = None) -> tuple[list[MFPosition], list[
 
     positions: list[MFPosition] = []
     warnings: list[str] = []
+    no_amfi_code = 0
 
     with path.open(newline="", encoding="utf-8-sig") as fh:
         reader = csv.DictReader(fh)
@@ -372,10 +373,7 @@ def load_mutual_funds(path: Path | None = None) -> tuple[list[MFPosition], list[
 
             code = (row.get(c_code) or "").strip() if c_code else ""
             if not code:
-                warnings.append(
-                    f"{name}: no AMFI code — NAV lookups and overlap analysis "
-                    f"will be unavailable for this scheme."
-                )
+                no_amfi_code += 1
 
             positions.append(
                 MFPosition(
@@ -390,6 +388,21 @@ def load_mutual_funds(path: Path | None = None) -> tuple[list[MFPosition], list[
                     folio=(row.get(c_folio) or "").strip() if c_folio else "",
                 )
             )
+
+    if no_amfi_code:
+        # See importers.py's _rows_to_mf for the same fix, in full — one
+        # line, not one per scheme: a direct-plan investor's statement
+        # never carries an AMFI code at all, so this would otherwise fire
+        # on every single row, every time, permanently, for a state that
+        # isn't a data problem to go fix.
+        plural = "" if no_amfi_code == 1 else "s"
+        warnings.append(
+            f"{path.name}: {no_amfi_code} scheme{plural} with no AMFI code — "
+            f"expected for direct-plan holdings (no distributor to supply "
+            f"one). NAV lookups and overlap analysis will be unavailable "
+            f"for {'it' if no_amfi_code == 1 else 'them'}; folio number is "
+            f"used to tell holdings apart instead."
+        )
 
     return positions, warnings
 
@@ -437,7 +450,12 @@ def load_portfolio(
 
         for file in inbox_files:
             try:
-                kind, positions, file_warnings = extract_positions(file)
+                # A single file can legitimately contain BOTH an equity
+                # table and a mutual-fund table as separate sections (a
+                # consolidated broker/DP statement, say) — extract_positions
+                # now always returns both lists, one empty if this
+                # particular file only had one kind.
+                file_equity, file_mfs, file_warnings = extract_positions(file)
             except ValueError as exc:
                 # Never silent: this is exactly the "couldn't read/pick up
                 # this file" failure mode, and previously left no trace
@@ -446,17 +464,20 @@ def load_portfolio(
                 warnings.append(str(exc))
                 continue
 
-            logger.info("holdings_inbox: %s: parsed as %s, %d position(s), "
-                        "%d warning(s)", file.name, kind, len(positions), len(file_warnings))
+            logger.info(
+                "holdings_inbox: %s: %d equity position(s), %d mutual-fund "
+                "position(s), %d warning(s)", file.name, len(file_equity),
+                len(file_mfs), len(file_warnings),
+            )
             for w in file_warnings:
                 logger.warning("holdings_inbox: %s", w)
 
             warnings.extend(file_warnings)
-            if kind == "equity":
-                equity.extend(positions)
+            if file_equity:
+                equity.extend(file_equity)
                 equity_path_exists = True
-            else:
-                mfs.extend(positions)
+            if file_mfs:
+                mfs.extend(file_mfs)
                 mf_result_present = True
 
     if not equity:
