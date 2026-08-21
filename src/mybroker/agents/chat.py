@@ -92,6 +92,9 @@ they meant.
 
 
 def build_options(run_id: str) -> ClaudeAgentOptions:
+    from mybroker.llm_config import ensure_supported_provider
+
+    ensure_supported_provider()
     set_current_run(run_id)
     return ClaudeAgentOptions(
         model=MODEL_WORKER,
@@ -116,16 +119,13 @@ def build_options(run_id: str) -> ClaudeAgentOptions:
 
 
 def _auth_status_line() -> str:
-    """Which credential the SDK subprocess will use. Neither build_options()
-    nor ClaudeAgentOptions sets an API key — the subprocess just inherits
-    this process's environment, so ANTHROPIC_API_KEY (if set) wins;
-    otherwise it falls back to a local `claude login` session. Local login
-    is the zero-config default; the env var is the override."""
-    import os
+    """Which provider/credential llm.yaml selects for this run. The actual
+    logic lives in llm_config.describe_active_provider() — this just applies
+    this module's own dim styling, same as cli.py's twin of this function
+    applies its own."""
+    from mybroker import llm_config
 
-    if os.environ.get("ANTHROPIC_API_KEY"):
-        return f"{DIM}auth: ANTHROPIC_API_KEY (env var override){RESET}"
-    return f"{DIM}auth: local `claude login` session (no ANTHROPIC_API_KEY set){RESET}"
+    return f"{DIM}{llm_config.describe_active_provider()}{RESET}"
 
 
 async def run_chat_repl() -> int:

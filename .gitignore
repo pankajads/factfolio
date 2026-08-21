@@ -15,6 +15,10 @@ logs/
 # illustrative and IS committed; this root-level one is your own project
 # copy (created by `factfolio init`, or a local dev copy for testing).
 /tickers.yaml
+# Same reasoning, same two sources (`factfolio init` / a local dev run) —
+# not financial data, but which LLM provider you use locally is still your
+# own project's config, not something to commit from this repo checkout.
+/llm.yaml
 *.db
 *.sqlite
 *.sqlite3

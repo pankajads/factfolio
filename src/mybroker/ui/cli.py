@@ -269,24 +269,39 @@ max_annual_turnover_pct: {vals['max_annual_turnover_pct']:.1f}
 | {date.today().isoformat()} | {changelog} |
 """
 
+
+def _ask_llm_provider() -> str:
+    """One question, only asked for a brand-new llm.yaml in an interactive
+    terminal (see cmd_init) — which LLM every agent should use. Falls back
+    to "claude_local" on Ctrl-C/EOF, same as _run_policy_interview does for
+    the policy questions."""
+    print(f"\n{BOLD}Which LLM should factfolio use?{RESET}")
+    print(f"{DIM}claude_local is the zero-config default (your local `claude "
+          f"login` session). anthropic_api needs an API key. chatgpt_api and "
+          f"codex are listed for the future but aren't implemented yet — "
+          f"you can hand-edit llm.yaml any time to switch.{RESET}")
+    try:
+        return _ask_choice(
+            "LLM provider —",
+            ("claude_local", "anthropic_api", "chatgpt_api", "codex"),
+            "claude_local",
+        )
+    except (EOFError, KeyboardInterrupt):
+        print(f"\n{DIM}Skipped — using claude_local.{RESET}")
+        return "claude_local"
+
+
 SEVERITY_STYLE = {"critical": "red", "high": "red", "medium": "yellow", "low": "dim"}
 
 
 def _auth_status_line() -> str:
-    """Which credential the Claude Agent SDK will actually use.
+    """Which provider/credential llm.yaml selects for this run. The actual
+    logic lives in llm_config.describe_active_provider() — this just applies
+    this module's own dim styling, same as chat.py's twin of this function
+    applies its own."""
+    from mybroker import llm_config
 
-    Neither `agents/orchestrator.py` nor `agents/chat.py` sets an API key —
-    the subprocess just inherits this process's environment, so the
-    resolution is entirely the `claude` CLI's own: ANTHROPIC_API_KEY, if
-    set, wins; otherwise it falls back to a local `claude login` session.
-    Local login is therefore the default with zero configuration, and
-    exporting the env var is the override — never the other way around.
-    """
-    import os
-
-    if os.environ.get("ANTHROPIC_API_KEY"):
-        return f"{DIM}auth: ANTHROPIC_API_KEY (env var override){RESET}"
-    return f"{DIM}auth: local `claude login` session (no ANTHROPIC_API_KEY set){RESET}"
+    return f"{DIM}{llm_config.describe_active_provider()}{RESET}"
 
 
 def cmd_status(_args) -> int:
@@ -678,6 +693,19 @@ def cmd_init(_args) -> int:
             config.DEFAULT_TICKERS_FILE.read_text(encoding="utf-8"), encoding="utf-8"
         )
         print(f"{GREEN}✓{RESET} Seeded {config.TICKERS_FILE} from the bundled defaults")
+
+    if config.LLM_FILE.exists():
+        print(f"{DIM}✓ {config.LLM_FILE} already exists — left untouched.{RESET}")
+    else:
+        from mybroker import llm_config
+
+        provider = _ask_llm_provider() if sys.stdin.isatty() else "claude_local"
+        config.LLM_FILE.write_text(llm_config.render_llm_yaml(provider), encoding="utf-8")
+        print(f"{GREEN}✓{RESET} Wrote {config.LLM_FILE} (provider: {provider})")
+        # Same reasoning as load_tickers.cache_clear() below — a stale cached
+        # llm.yaml (e.g. from an earlier test/process in the same run) must
+        # not shadow the file just written.
+        llm_config.load_llm_config.cache_clear()
 
     added = _seed_draft_ticker_entries(config.TICKERS_FILE)
     if added:
@@ -1299,8 +1327,11 @@ def _print_getting_started(target: Path, tickers_file: Path) -> None:
 
     print(f"\n{BOLD}The LLM, in short:{RESET} `report`, `chat`, `init`, and mcp's "
           f"run_portfolio_review call one —")
-    print("  your local `claude login` session by default, or export "
-          "ANTHROPIC_API_KEY to override.")
+    print(f"  which one is set in {target / 'llm.yaml'}: your local `claude "
+          f"login` session by default")
+    print("  (claude_local), or an explicit API key (anthropic_api). Hand-edit "
+          "that file any time to")
+    print("  switch — flip the flags, save, no re-init needed.")
     print("  `validate` is pure deterministic Python by default, no LLM — it "
           "only ever asks to call")
     print("  one, interactively, if it finds a holding it can't map, or a "

@@ -279,6 +279,54 @@ def test_does_not_overwrite_an_existing_tickers_yaml(isolated_project):
     assert (project_dir / "tickers.yaml").read_text() == "symbols: {CUSTOM: {}}"
 
 
+# ── llm.yaml seeding ─────────────────────────────────────────────────────────
+
+def test_seeds_llm_yaml_with_claude_local_enabled_by_default(isolated_project):
+    """Non-interactive run (the default under pytest — stdin isn't a tty):
+    no provider question, just the zero-config default."""
+    assert cmd_init(None) == 0
+
+    project_llm = isolated_project / "factfolio" / "llm.yaml"
+    assert project_llm.exists()
+    providers = yaml.safe_load(project_llm.read_text())["providers"]
+    assert providers["claude_local"]["enabled"] is True
+    for name in ("anthropic_api", "chatgpt_api", "codex"):
+        assert providers[name]["enabled"] is False
+
+
+def test_does_not_overwrite_an_existing_llm_yaml(isolated_project):
+    project_dir = isolated_project / "factfolio"
+    (project_dir / "memory").mkdir(parents=True)
+    (project_dir / "memory" / "investment_policy.md").write_text("MY POLICY")
+    (project_dir / "tickers.yaml").write_text("symbols: {}")
+    (project_dir / "llm.yaml").write_text("providers: {CUSTOM: {enabled: true}}")
+
+    cmd_init(None)
+
+    assert (project_dir / "llm.yaml").read_text() == "providers: {CUSTOM: {enabled: true}}"
+
+
+def test_interactive_init_writes_the_chosen_llm_provider(isolated_project, monkeypatch):
+    """The 4 policy-interview questions (Enter accepts each default), then
+    the new 5th question picking a provider — see _ask_llm_provider. Only
+    the chosen entry flips to enabled; every other provider stays present,
+    with its description/api_key_env intact, just disabled — never removed
+    or blanked out by picking a different one."""
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    answers = iter(["", "", "", "", "anthropic_api"])
+    monkeypatch.setattr("builtins.input", lambda *_a, **_kw: next(answers))
+
+    assert cmd_init(None) == 0
+
+    project_llm = isolated_project / "factfolio" / "llm.yaml"
+    providers = yaml.safe_load(project_llm.read_text())["providers"]
+    assert set(providers) == {"claude_local", "anthropic_api", "chatgpt_api", "codex"}
+    assert providers["anthropic_api"]["enabled"] is True
+    for name in ("claude_local", "chatgpt_api", "codex"):
+        assert providers[name]["enabled"] is False
+        assert providers[name]["description"]  # present, just disabled
+
+
 # ── Draft tickers.yaml entries seeded from holdings ──────────────────────────
 # Real-world request: rather than seeding tickers.yaml purely from the
 # maintainer's own bundled portfolio, scan the holdings you've actually
@@ -308,11 +356,16 @@ _HOLDINGS_CSV_HEADER = (
 def _init_project(isolated_project, tickers_yaml_text):
     """A pre-initialized project folder with specific tickers.yaml content,
     so cmd_init() reuses it in place rather than creating a fresh nested
-    copy — see _resolve_init_target."""
+    copy — see _resolve_init_target. Also seeds llm.yaml (claude_local
+    enabled) so cmd_init's own llm.yaml block — which would otherwise ask
+    an extra interactive question the many tests built on top of this
+    helper don't account for in their input() answer sequences — is a
+    no-op skip here too, same as the policy/tickers files above."""
     project_dir = isolated_project / "factfolio"
     (project_dir / "memory").mkdir(parents=True)
     (project_dir / "memory" / "investment_policy.md").write_text("MY POLICY")
     (project_dir / "tickers.yaml").write_text(tickers_yaml_text)
+    (project_dir / "llm.yaml").write_text("providers:\n  claude_local:\n    enabled: true\n")
     return project_dir
 
 
@@ -1359,7 +1412,9 @@ def test_interview_returns_none_on_eof_instead_of_crashing(monkeypatch):
 
 def test_init_runs_the_interview_when_interactive(isolated_project, monkeypatch):
     monkeypatch.setattr("sys.stdin.isatty", lambda: True)
-    answers_iter = iter(["9", "conservative", "5", "10000"])
+    # 4 policy answers + "" (accept the claude_local default) for the new
+    # LLM-provider question that follows it — see _ask_llm_provider.
+    answers_iter = iter(["9", "conservative", "5", "10000", ""])
     monkeypatch.setattr("builtins.input", lambda *_a, **_kw: next(answers_iter))
 
     assert cmd_init(None) == 0

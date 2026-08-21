@@ -1,6 +1,6 @@
 [project]
 name = "factfolio"
-version = "0.4.1"
+version = "0.5.0"
 description = "FactFolio — open-source, evidence-based portfolio advisory for Indian equity & mutual funds. Every number traceable to a tool call, never a guess."
 readme = "README.md"
 requires-python = ">=3.12"

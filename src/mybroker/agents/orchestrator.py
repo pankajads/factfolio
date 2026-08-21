@@ -198,6 +198,9 @@ class RunResult:
 def build_options(run_id: str) -> ClaudeAgentOptions:
     """Permission posture: read-only, tightly allowlisted, audited, subagent-
     capable. Every hook here applies session-wide, including subagents."""
+    from mybroker.llm_config import ensure_supported_provider
+
+    ensure_supported_provider()
     set_current_run(run_id)
 
     return ClaudeAgentOptions(

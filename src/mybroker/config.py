@@ -32,6 +32,11 @@ SRC_DIR = Path(__file__).resolve().parent
 
 DEFAULT_TICKERS_FILE = SRC_DIR / "data" / "tickers.yaml"
 
+# The generic, committed llm.yaml every project's own copy is seeded from —
+# see llm_config.py. Kept in sync with llm_config.render_llm_yaml("claude_local")
+# by test_llm_config.py, same idea as DEFAULT_TICKERS_FILE above.
+DEFAULT_LLM_FILE = SRC_DIR / "data" / "llm.yaml"
+
 
 def _apply_root(root: Path) -> None:
     """(Re)derive every PROJECT_ROOT-relative constant from `root`.
@@ -50,6 +55,7 @@ def _apply_root(root: Path) -> None:
     global HOLDINGS_INBOX_DIR, MEMORY_DIR, THESES_DIR, REPORTS_DIR, LOGS_DIR
     global CACHE_DIR, CACHE_DB, TOOL_LOG, CRON_LOG, LEDGER_FILE, POLICY_FILE
     global RESOLVED_TICKERS, WRITABLE_DIRS, TICKERS_FILE, COLUMN_MAP_CACHE
+    global LLM_FILE
 
     PROJECT_ROOT = root
 
@@ -91,6 +97,10 @@ def _apply_root(root: Path) -> None:
     # Your own symbol map, seeded from DEFAULT_TICKERS_FILE at `factfolio
     # init` and yours to edit from then on — see load_tickers().
     TICKERS_FILE = PROJECT_ROOT / "tickers.yaml"
+
+    # Which LLM provider every agent uses, seeded by `factfolio init` and
+    # yours to hand-edit from then on — see llm_config.py.
+    LLM_FILE = PROJECT_ROOT / "llm.yaml"
 
     # Directories the agent is permitted to write to. Enforced by security hooks.
     WRITABLE_DIRS = (MEMORY_DIR, REPORTS_DIR, LOGS_DIR, CACHE_DIR)
