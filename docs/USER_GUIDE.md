@@ -25,7 +25,7 @@ uv run factfolio init
 cd factfolio
 ```
 
-`factfolio init` does six things, safe to re-run any time:
+`factfolio init` does seven things, safe to re-run any time:
 
 1. Creates a dedicated `factfolio/` project folder under wherever you ran
    it (yes, this means `factfolio/factfolio/` right after a fresh clone —
@@ -49,16 +49,23 @@ cd factfolio
 3. Seeds your own `tickers.yaml` at the project root, copied from the
    bundled defaults — yours to add symbols to from then on (see
    [§3](#3-add-your-holdings)). Never overwritten on a re-run either.
-4. Scans `holdings.csv`/`holdings_inbox/` for symbols you hold that
+4. Writes your own **`llm.yaml`** at the project root, copied from the
+   bundled `src/mybroker/data/llm.yaml` (dummy/example data — browse it in
+   the repo to see the format) with `claude_local` enabled. In an
+   interactive terminal, it asks which LLM provider to use — see
+   [§4](#4-authentication) for the choices — and flags that one instead,
+   leaving every other provider in the file, just disabled. Never
+   overwritten on a re-run either.
+5. Scans `holdings.csv`/`holdings_inbox/` for symbols you hold that
    aren't mapped yet and adds a DRAFT entry for each — see
    [§3](#3-add-your-holdings) for exactly what qualifies and what a
    drafted entry looks like. Re-running `init` after adding a new holding
    picks up just the new symbol, never re-touching an existing entry.
-5. For holdings that only have a full company name (no genuine symbol to
+6. For holdings that only have a full company name (no genuine symbol to
    draft from), asks an agent to research and resolve each one — see
    [§3](#3-add-your-holdings) for what it can and can't safely decide on
    its own, and what it falls back to without a `claude` login.
-6. Prints exactly where it landed and what to do next.
+7. Prints exactly where it landed and what to do next.
 
 Every command below this point — and the rest of this guide — assumes
 you've `cd`ed into that `factfolio/` project folder. That checklist is
@@ -221,18 +228,23 @@ doesn't get re-checked on every run.
 
 ## 4. Authentication
 
-`factfolio report` and `factfolio chat` need Claude. Nothing else does.
+`factfolio report` and `factfolio chat` need an LLM. Nothing else does.
+Which one is set in your project's `llm.yaml` — seeded by `factfolio init`
+(it asks once, interactively) from the bundled, committed example at
+[`src/mybroker/data/llm.yaml`](../src/mybroker/data/llm.yaml) — browse that
+file if you just want to see the format — and yours to hand-edit any time
+afterward: flip the `enabled:` flags, save, no re-`init` needed. Exactly one
+provider must be `enabled: true`:
 
-- **Default — local login.** Run `claude login` once (Pro/Max subscription
-  or Anthropic Console) and every LLM command here just works — this
-  project never sets its own API key, it lets the `claude` CLI resolve
-  credentials itself.
-- **Override — `export ANTHROPIC_API_KEY=...`.** Takes precedence
-  automatically if set. Useful for a different billing account, a CI box,
-  or a machine with no interactive login.
+| Provider | Status | Auth |
+|---|---|---|
+| `claude_local` (default) | Runs today | Your local `claude login` session — Pro/Max or Console |
+| `anthropic_api` | Runs today | An explicit API key — `export ANTHROPIC_API_KEY=...` (or `llm.yaml`'s `api_key_env:`) |
+| `chatgpt_api` | Not implemented yet | Placeholder — enabling it fails fast with a clear error, no OpenAI calls happen |
+| `codex` | Not implemented yet | Placeholder — same as above |
 
-Every LLM-calling command prints which one is active, so it's never
-ambiguous. Full detail in the [README](../README.md#authentication).
+Every LLM-calling command prints which provider/credential is active, so
+it's never ambiguous. Full detail in the [README](../README.md#authentication).
 
 ## 5. Customise your policy
 

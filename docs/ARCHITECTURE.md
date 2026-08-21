@@ -256,6 +256,7 @@ silently parses to an empty or wrong result.
 ```
 src/mybroker/
 ├── config.py              # every path, in one place — security hooks depend on this
+├── llm_config.py          # llm.yaml — which LLM provider every agent uses
 ├── portfolio/
 │   ├── loader.py           # strict root-file parsing + load_portfolio() merge
 │   ├── importers.py        # permissive holdings_inbox/ parsing (csv/xls/xlsx/pdf/txt)

@@ -87,12 +87,14 @@ uvx factfolio init          # runs it straight from PyPI, nothing installed pers
 # or: pip install factfolio && factfolio init
 ```
 `init` creates a `factfolio/` project folder under wherever you ran it —
-memory, holdings, reports, your own `tickers.yaml`, everything for *this*
-portfolio lives there — and prints the exact `cd` command plus what to do
-next. In an interactive terminal it also asks 4 quick questions (target
-CAGR, risk appetite, horizon, monthly capital) to seed a real starter
-`investment_policy.md` instead of pure placeholders — plain text either
-way, so edit it again anytime your numbers change. Run every other command
+memory, holdings, reports, your own `tickers.yaml` and `llm.yaml`,
+everything for *this* portfolio lives there — and prints the exact `cd`
+command plus what to do next. In an interactive terminal it also asks 4
+quick questions (target CAGR, risk appetite, horizon, monthly capital) to
+seed a real starter `investment_policy.md` instead of pure placeholders —
+plain text either way, so edit it again anytime your numbers change — plus
+one more picking which LLM provider to use (see
+[Authentication](#authentication)). Run every other command
 from inside the folder it creates. Re-running `init` is always safe: from
 inside an existing project it just refreshes in place, and it never
 overwrites an unrelated folder that happens to already be named
@@ -152,20 +154,27 @@ yourself (versioning, PyPI, the executables above): [`docs/RELEASING.md`](docs/R
 
 ### Authentication
 
-`factfolio report` and `factfolio chat` call the Claude Agent SDK, which
-shells out to the `claude` CLI and lets *it* resolve credentials — this
-project never sets an API key itself. That means:
+Which LLM `factfolio report` and `factfolio chat` call is set in
+`llm.yaml`, seeded into your project by `factfolio init` (asked once,
+interactively) from the bundled, committed example at
+[`src/mybroker/data/llm.yaml`](src/mybroker/data/llm.yaml) — browse that
+file directly if you just want to see the format — and yours to hand-edit
+any time afterward: flip the flags, save, no re-`init` needed. Exactly one
+provider is `enabled: true`:
 
-- **Default: your local `claude login` session.** If you're already logged
-  in (`claude` in a terminal, Pro/Max or Console), no setup is needed —
-  every LLM-calling command here just works.
-- **Override: `export ANTHROPIC_API_KEY=...`.** Set it and it takes
-  precedence automatically — useful for a different billing account, CI, or
-  a machine with no interactive login.
+- **`claude_local` (default).** Your local `claude login` session — if
+  you're already logged in (`claude` in a terminal, Pro/Max or Console), no
+  setup is needed.
+- **`anthropic_api`.** The same Claude Agent SDK, authenticated via an
+  explicit key instead — `export ANTHROPIC_API_KEY=...` (or whichever env
+  var `llm.yaml`'s `api_key_env:` names). Useful for a different billing
+  account, CI, or a machine with no interactive login.
+- **`chatgpt_api` / `codex`.** Listed for the future, not implemented yet —
+  enabling one fails fast with a clear error rather than silently doing
+  nothing.
 
-Every command that calls the LLM prints which one is active
-(`auth: local claude login session` / `auth: ANTHROPIC_API_KEY (env var
-override)`) so it's never ambiguous which credential a run used.
+Every command that calls the LLM prints which provider/credential is
+active, so it's never ambiguous which one a run used.
 `factfolio status`/`validate`/`cron`/`estimate-dates` need neither — they're
 pure deterministic Python.
 

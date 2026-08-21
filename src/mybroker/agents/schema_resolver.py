@@ -174,6 +174,9 @@ def _parse_response(text: str) -> dict:
 
 
 def build_options(run_id: str) -> ClaudeAgentOptions:
+    from mybroker.llm_config import ensure_supported_provider
+
+    ensure_supported_provider()
     set_current_run(run_id)
     return ClaudeAgentOptions(
         model=MODEL_WORKER,

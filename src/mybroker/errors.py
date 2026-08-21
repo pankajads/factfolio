@@ -60,6 +60,12 @@ def friendly_message(exc: BaseException) -> str:
     """
     from claude_agent_sdk import CLIConnectionError, CLINotFoundError, ProcessError
 
+    from mybroker.llm_config import UnsupportedProviderError
+
+    if isinstance(exc, UnsupportedProviderError):
+        # Already a short, actionable message — see llm_config.py — no
+        # rewriting needed, unlike the SDK exceptions below.
+        return str(exc)
     if isinstance(exc, CLINotFoundError):
         return (
             "The `claude` CLI wasn't found on PATH. Install it "

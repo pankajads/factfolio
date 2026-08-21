@@ -315,6 +315,9 @@ async def resolve_names(holdings: list[dict]) -> list[ResolvedName]:
     do the resolution when it can, not to decide what happens when it
     can't.
     """
+    from mybroker.llm_config import ensure_supported_provider
+
+    ensure_supported_provider()
     evidence: dict[str, list[dict]] = {}
     run_id = f"tickerresolve-{uuid.uuid4().hex[:8]}"
     set_current_run(run_id)

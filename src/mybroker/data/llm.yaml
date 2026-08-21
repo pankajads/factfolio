@@ -1,0 +1,37 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# LLM provider selection
+#
+# Exactly ONE provider below must be `enabled: true` — factfolio uses it to
+# run every agent (report, chat, ticker/schema resolvers).
+#
+# TO SWITCH PROVIDERS BY HAND: set the one you want to `enabled: true` and
+# every other provider's `enabled: false` (exactly one true at a time), save,
+# then just re-run `factfolio` — no `init`, no restart, nothing else needed.
+#
+# claude_local and anthropic_api both run today, via the same underlying
+# claude_agent_sdk — they differ only in auth: claude_local uses your local
+# `claude login` session, anthropic_api uses an explicit API key.
+#
+# chatgpt_api and codex are placeholders for future providers. Enabling one
+# is a valid choice, but factfolio doesn't talk to OpenAI yet — it fails
+# fast with a clear error instead of silently doing nothing.
+# ─────────────────────────────────────────────────────────────────────────────
+providers:
+  claude_local:
+    enabled: true
+    description: "Local Claude Code CLI session (`claude login`). Zero-config default."
+
+  anthropic_api:
+    enabled: false
+    description: "Anthropic API via an explicit key, through the same claude_agent_sdk."
+    api_key_env: ANTHROPIC_API_KEY
+
+  chatgpt_api:
+    enabled: false
+    description: "OpenAI ChatGPT API. NOT YET IMPLEMENTED — placeholder for a future release."
+    api_key_env: OPENAI_API_KEY
+
+  codex:
+    enabled: false
+    description: "OpenAI Codex CLI. NOT YET IMPLEMENTED — placeholder for a future release."
+    api_key_env: OPENAI_API_KEY
