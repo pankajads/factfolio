@@ -84,7 +84,7 @@ def test_holdings_inbox_ingestion_is_logged(tmp_path):
     )
 
     log_text = (tmp_path / "logs" / "factfolio.log").read_text()
-    assert "broker.csv: parsed as equity, 1 position" in log_text
+    assert "broker.csv: 1 equity position(s), 0 mutual-fund position(s)" in log_text
     assert "junk.csv: could not parse" in log_text
 
 
@@ -126,9 +126,12 @@ def test_agent_resolver_failure_is_logged_not_swallowed(monkeypatch):
     the AI-assisted resolver and silently fall back to plain search, with
     the actual failure reason (no `claude login`, network, etc.) lost
     forever. It must now be logged."""
+    from mybroker.portfolio import ticker_seeding
     from mybroker.ui import cli
 
-    monkeypatch.setattr(cli, "_collect_unmapped_holdings", lambda: [{"name": "SOME CO LTD"}])
+    monkeypatch.setattr(
+        ticker_seeding, "collect_unmapped_holdings", lambda: [{"name": "SOME CO LTD"}]
+    )
 
     def _boom(_todo, _skipped):
         raise RuntimeError("no `claude` login found")

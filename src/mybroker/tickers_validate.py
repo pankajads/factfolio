@@ -35,7 +35,11 @@ from mybroker.config import (
     ensure_dirs,
     load_tickers,
 )
-from mybroker.portfolio.ticker_seeding import holdings_present, seed_draft_ticker_entries
+from mybroker.portfolio.ticker_seeding import (
+    collect_unmapped_holdings,
+    holdings_present,
+    seed_draft_ticker_entries,
+)
 
 GREEN, RED, YELLOW, DIM, RESET = "\033[32m", "\033[31m", "\033[33m", "\033[2m", "\033[0m"
 OK, FAIL, WARN = f"{GREEN}✓{RESET}", f"{RED}✗{RESET}", f"{YELLOW}!{RESET}"
@@ -177,6 +181,18 @@ def main() -> int:
               f"{TICKERS_FILE} from your holdings — DRAFT, review before "
               f"relying on them: {', '.join(sorted(added))}\n")
 
+    # Deliberately checked even when `added` is non-empty: seed_draft_ticker_
+    # entries only handles holdings whose symbol column already looks like a
+    # genuine short trading symbol. A full-company-name holding (a demat
+    # statement's "Scrip Name" column, say) can't be drafted that way at all
+    # — it's invisible to everything above — and this tool will never
+    # AI-resolve it itself (validate is pure deterministic Python, no LLM,
+    # on purpose). Without this check, that holding just never gets a
+    # tickers.yaml entry, and every other unrelated symbol resolving fine
+    # made the run below end in a clean "✓ All tickers resolved" that had
+    # nothing to say about the holdings missing from it entirely.
+    unmapped = collect_unmapped_holdings()
+
     cfg = load_tickers()
     if not cfg.get("symbols"):
         logger.warning("validate: tickers.yaml has no symbols mapped — nothing to validate")
@@ -222,6 +238,31 @@ def main() -> int:
         logger.error("validate: unresolved: %s", ", ".join(failures))
         print(f"\n{FAIL} UNRESOLVED: {', '.join(failures)}")
         print(f"  {DIM}Add working candidates to {TICKERS_FILE}{RESET}\n")
+        return 1
+
+    if unmapped:
+        names = [h["name"] for h in unmapped]
+        logger.error(
+            "validate: %d holding(s) never made it into %s: %s",
+            len(names), TICKERS_FILE.name, ", ".join(names),
+        )
+        print(f"\n{FAIL} {len(names)} holding(s) in your holdings files were never "
+              f"mapped into {TICKERS_FILE} at all — not unresolved, just never "
+              f"attempted. Everything above resolved fine, but it's a partial "
+              f"portfolio: a full-company-name column (a demat statement's "
+              f"\"Scrip Name\", say) can't be auto-drafted the way a short "
+              f"trading symbol can.")
+        for h in unmapped[:10]:
+            hint = (
+                f"  {DIM}(candidate from elsewhere in the same row: "
+                f"{h['candidate_symbol']}, unverified){RESET}"
+                if h.get("candidate_symbol") else ""
+            )
+            print(f"    {h['name']}{hint}")
+        if len(names) > 10:
+            print(f"    … and {len(names) - 10} more")
+        print(f"  {DIM}Run `factfolio init` for AI-assisted resolution, or add "
+              f"them to {TICKERS_FILE} yourself, then re-run validate.{RESET}\n")
         return 1
 
     print(f"\n{OK} All tickers resolved.\n")

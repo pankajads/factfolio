@@ -5,7 +5,7 @@ subagent roster, no mandatory devils-advocate pass, and a cheaper model
 (MODEL_WORKER, not MODEL_ORCHESTRATOR) — a single Q&A turn should be fast and
 cheap, not a multi-minute multi-agent review. `log_recommendation` is
 deliberately NOT in chat's tool list: formal, ledger-tracked recommendations
-still go through `mybroker report`, where the adversarial review is a
+still go through `factfolio report`, where the adversarial review is a
 mandatory step in the system prompt. Chat can discuss what a good call might
 look like, but it does not write one to the ledger — say so if asked.
 
@@ -77,7 +77,7 @@ recommendations have performed (review_recommendation_outcomes).
 
 You do not log formal recommendations — `log_recommendation` is not
 available to you. If the user wants an official, ledger-tracked, adversarially-
-reviewed BUY/SELL/TRIM recommendation, tell them to run `mybroker report`.
+reviewed BUY/SELL/TRIM recommendation, tell them to run `factfolio report`.
 You can still discuss what you think, informally, clearly framed as
 unreviewed chat opinion, not a logged call.
 
@@ -135,7 +135,7 @@ async def run_chat_repl() -> int:
     run_id = f"chat-{started.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
     options = build_options(run_id)
 
-    print(f"{BOLD}mybroker chat{RESET}  {DIM}(model={MODEL_WORKER}, run {run_id}, "
+    print(f"{BOLD}factfolio chat{RESET}  {DIM}(model={MODEL_WORKER}, run {run_id}, "
           f"'exit' to quit){RESET}", file=sys.stderr)
     print(_auth_status_line(), file=sys.stderr)
     print(file=sys.stderr)

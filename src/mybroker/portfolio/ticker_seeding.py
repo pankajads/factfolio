@@ -154,13 +154,27 @@ def is_pristine_draft(tickers_file: Path, symbol: str) -> bool:
 
 
 def backfill_draft_entry(
-    tickers_file: Path, symbol: str, *, name: str, sector: str | None = None
+    tickers_file: Path, symbol: str, *, name: str, sector: str | None = None,
+    alias: str | None = None,
 ) -> bool:
     """Update just the `name:` (and `sector:`, if given and not already
     set) fields on an EXISTING tickers.yaml entry in place — call only
     after is_pristine_draft() confirms it's safe. Never touches
     candidates/tier/bucket/notes; those still need a human's own judgment
     regardless of where the name came from.
+
+    `alias`, if given, gets inserted as a new `aliases:` line right after
+    `name:` — recording the RAW source text this backfill was resolved
+    from, verbatim. See config.py's resolve_symbol_by_name for why this
+    matters: a source file's own PDF-wrapping ("VODAFON E IDEA LIMITED")
+    or a broker's abbreviations routinely make the raw text normalize to
+    something the clean `name:` field this call just wrote never will —
+    without recording the exact raw text somewhere, this same holding
+    gets re-flagged as "still unmapped" the very next time its source
+    file is re-scanned, even though it was already correctly resolved
+    moments ago. A pristine draft (this function's only precondition)
+    never already has an aliases line, so this is always a fresh insert,
+    never a merge.
 
     Returns False (touching nothing) if the entry can't be found at all.
     """
@@ -181,16 +195,91 @@ def backfill_draft_entry(
             break
 
     changed = False
+    new_lines = list(lines[: key_idx + 1])
     for i in range(key_idx + 1, end):
-        if re.match(r"^    name:\s", lines[i]):
-            lines[i] = f"    name: {name}\n"
+        line = lines[i]
+        if re.match(r"^    name:\s", line):
+            new_lines.append(f"    name: {name}\n")
             changed = True
-        elif sector and re.match(r"^    sector:\s", lines[i]):
-            lines[i] = f"    sector: {sector}\n"
+            if alias:
+                alias_yaml = yaml.safe_dump([alias], default_flow_style=True).strip()
+                new_lines.append(f"    aliases: {alias_yaml}  # raw source text this was resolved from\n")
+            continue
+        if sector and re.match(r"^    sector:\s", line):
+            new_lines.append(f"    sector: {sector}\n")
+            continue
+        new_lines.append(line)
+    new_lines.extend(lines[end:])
 
     if not changed:
         return False
 
+    tickers_file.write_text("".join(new_lines), encoding="utf-8")
+    return True
+
+
+def add_alias_to_entry(tickers_file: Path, symbol: str, alias: str) -> bool:
+    """Record `alias` (raw source text) as another recognised name for an
+    EXISTING entry, merging into whatever `aliases:` list it already has
+    rather than overwriting it — the case backfill_draft_entry doesn't
+    cover: an entry that's already fully resolved (a real `name:`, no
+    longer a pristine draft) but whose raw source text still doesn't
+    match that name closely enough for resolve_symbol_by_name's fuzzy
+    match (a PDF line-wrap — "TATA STEEL LIMITED" vs a clean "Tata Steel"
+    — or a broker's own abbreviation).
+
+    Without this, a human confirming "yes, this really is the same
+    holding" at the interactive accept/edit/skip prompt (cli.py's
+    _write_reviewed_symbol) had nothing durable to write when the
+    suggested symbol already existed — the confirmation was thrown away
+    every single run, so the exact same holding came back as "never
+    mapped" on the very next `factfolio validate`, with no way out of the
+    loop at all.
+
+    A no-op (returns True, touches nothing) if `alias` is already
+    recorded. Returns False (touching nothing) if `symbol` isn't in
+    tickers_file at all.
+    """
+    text = tickers_file.read_text(encoding="utf-8")
+    lines = text.splitlines(keepends=True)
+    key_pattern = re.compile(rf"^  {re.escape(symbol)}:\s*$")
+    try:
+        key_idx = next(i for i, line in enumerate(lines) if key_pattern.match(line))
+    except StopIteration:
+        return False
+
+    end = len(lines)
+    for i in range(key_idx + 1, len(lines)):
+        if re.match(r"^  \S.*:\s*$", lines[i]) or re.match(r"^[A-Za-z_]", lines[i]):
+            end = i
+            break
+
+    alias_idx = None
+    for i in range(key_idx + 1, end):
+        if re.match(r"^    aliases:\s", lines[i]):
+            alias_idx = i
+            break
+
+    if alias_idx is not None:
+        existing = yaml.safe_load(lines[alias_idx].split(":", 1)[1].split("#")[0]) or []
+        if alias in existing:
+            return True
+        existing.append(alias)
+        alias_yaml = yaml.safe_dump(existing, default_flow_style=True).strip()
+        lines[alias_idx] = f"    aliases: {alias_yaml}  # raw source text this was resolved from\n"
+        tickers_file.write_text("".join(lines), encoding="utf-8")
+        return True
+
+    name_idx = None
+    for i in range(key_idx + 1, end):
+        if re.match(r"^    name:\s", lines[i]):
+            name_idx = i
+            break
+    if name_idx is None:
+        return False
+
+    alias_yaml = yaml.safe_dump([alias], default_flow_style=True).strip()
+    lines.insert(name_idx + 1, f"    aliases: {alias_yaml}  # raw source text this was resolved from\n")
     tickers_file.write_text("".join(lines), encoding="utf-8")
     return True
 
@@ -207,3 +296,42 @@ def holdings_present() -> bool:
     from mybroker.portfolio.importers import discover_inbox_files
 
     return HOLDINGS_EQUITY.exists() or bool(discover_inbox_files(HOLDINGS_INBOX_DIR))
+
+
+def collect_unmapped_holdings() -> list[dict]:
+    """Every full-name holding (name + quantity + avg_cost) across
+    holdings.csv and holdings_inbox/ that discover_equity_symbols_for_
+    drafting can't auto-draft a symbol for — a demat statement's "Scrip
+    Name" column, say — and that isn't already resolvable against the
+    current tickers.yaml.
+
+    Shared by both callers that need to know this count, not just draft
+    what they can: `factfolio init`'s AI-assisted resolver (cli.py's
+    _suggest_ticker_matches) actually resolves them; `factfolio validate`
+    (tickers_validate.py) doesn't — and deliberately never will, since
+    validate is documented as pure deterministic Python with no LLM call —
+    but it must still SAY so out loud instead of reporting "all tickers
+    resolved" while these sit completely unmapped. Before this existed,
+    that gap was silent: validate only ever round-tripped tickers.yaml's
+    own recorded symbols against yfinance, never checked whether every
+    holding actually made it into tickers.yaml in the first place — so a
+    portfolio with unmapped full-name holdings still got a clean "✓ All
+    tickers resolved", and the only way to discover the missing ones was to
+    separately think to re-run `init`.
+    """
+    from mybroker.config import HOLDINGS_EQUITY, HOLDINGS_INBOX_DIR
+    from mybroker.portfolio.importers import discover_inbox_files, discover_unmapped_full_names
+
+    sources = []
+    if HOLDINGS_EQUITY.exists():
+        sources.append(HOLDINGS_EQUITY)
+    sources.extend(discover_inbox_files(HOLDINGS_INBOX_DIR))
+
+    holdings: list[dict] = []
+    seen: set[str] = set()
+    for file in sources:
+        for h in discover_unmapped_full_names(file):
+            if h["name"] not in seen:
+                seen.add(h["name"])
+                holdings.append(h)
+    return holdings

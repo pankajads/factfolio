@@ -117,6 +117,38 @@ def test_full_company_name_only_holdings_cannot_be_auto_drafted(capsys):
     assert "factfolio init" in out
 
 
+def test_mixed_holdings_reports_the_full_name_ones_left_unmapped(monkeypatch, capsys):
+    """Regression for the reported bug: a portfolio with BOTH a genuine
+    short-symbol holding (auto-drafted and resolved fine) AND a
+    full-company-name-only holding (never drafted) used to report a clean
+    "✓ All tickers resolved" — the full-name holding was invisible to every
+    check, since it's not in tickers.yaml at all, so there was nothing for
+    the resolution loop to fail on. The only way to discover it was missing
+    was to separately think to re-run `factfolio init`. validate must now
+    say so itself and fail, not silently pass on a partial portfolio."""
+    tickers_validate.HOLDINGS_INBOX_DIR.mkdir(parents=True, exist_ok=True)
+    (tickers_validate.HOLDINGS_INBOX_DIR / "broker.csv").write_text(
+        "Symbol,Qty,Avg Price,Invested,Current Value\nNEWSTOCK,10,100.0,1000.0,1100.0\n"
+    )
+    (tickers_validate.HOLDINGS_INBOX_DIR / "demat.csv").write_text(
+        "Scrip Name,Total Qty,Avg Rate,Holding Value,LTP,Market Value,PL (Rs.),PL%\n"
+        "AXIS BANK LIMITED,4,851.71,3406.85,731.55,2926.20,-480.64,-0.56\n"
+    )
+    monkeypatch.setattr(tickers_validate, "probe", _fake_probe)
+
+    assert tickers_validate.main() == 1
+
+    out = capsys.readouterr().out
+    assert "All tickers resolved" not in out
+    assert "NEWSTOCK" in out  # the genuine symbol still got drafted and resolved
+    assert "never" in out.lower() and "AXIS BANK LIMITED" in out
+    assert "factfolio init" in out
+
+    data = yaml.safe_load(tickers_validate.TICKERS_FILE.read_text())
+    assert "NEWSTOCK" in data["symbols"]
+    assert not any("AXIS" in k for k in data["symbols"])  # confirmed never drafted
+
+
 def test_existing_tickers_yaml_with_no_symbols_prompts_instead_of_passing(capsys):
     """A tickers.yaml that parses but maps nothing must not report a
     misleadingly clean 0/0 resolution."""

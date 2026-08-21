@@ -49,7 +49,7 @@ def _apply_root(root: Path) -> None:
     global PROJECT_ROOT, HOLDINGS_EQUITY, HOLDINGS_MF, ASSETS_FILE
     global HOLDINGS_INBOX_DIR, MEMORY_DIR, THESES_DIR, REPORTS_DIR, LOGS_DIR
     global CACHE_DIR, CACHE_DB, TOOL_LOG, CRON_LOG, LEDGER_FILE, POLICY_FILE
-    global RESOLVED_TICKERS, WRITABLE_DIRS, TICKERS_FILE
+    global RESOLVED_TICKERS, WRITABLE_DIRS, TICKERS_FILE, COLUMN_MAP_CACHE
 
     PROJECT_ROOT = root
 
@@ -76,6 +76,17 @@ def _apply_root(root: Path) -> None:
     LEDGER_FILE = MEMORY_DIR / "decision_journal.md"
     POLICY_FILE = MEMORY_DIR / "investment_policy.md"
     RESOLVED_TICKERS = CACHE_DIR / "resolved_tickers.json"
+
+    # A holdings_inbox file's column layout, once an AI-assisted resolution
+    # (agents/schema_resolver.py) has mapped it and that mapping passed
+    # grounding against the file's own real data — keyed by header
+    # signature (see portfolio/importers.py's _header_signature), not
+    # filename, so the SAME broker/DP export format is recognised
+    # immediately in any future file, never re-asking for a format
+    # already learned once. The deterministic keyword-based column
+    # matching stays the fast, free, always-tried-first path; this is
+    # only ever consulted for a header it didn't already resolve.
+    COLUMN_MAP_CACHE = CACHE_DIR / "column_maps.json"
 
     # Your own symbol map, seeded from DEFAULT_TICKERS_FILE at `factfolio
     # init` and yours to edit from then on — see load_tickers().
@@ -185,8 +196,8 @@ def _normalize_company_name(name: str) -> str:
 
 
 def resolve_symbol_by_name(display_name: str) -> str | None:
-    """Best-effort: the tickers.yaml symbol whose own `name:` field
-    normalizes to the same thing as `display_name`.
+    """Best-effort: the tickers.yaml symbol whose own `name:` field (or
+    recorded `aliases:`) normalizes to the same thing as `display_name`.
 
     Needed for holdings sources whose only identifying column is a full
     company name rather than a trading symbol — a demat "Consolidated
@@ -194,15 +205,40 @@ def resolve_symbol_by_name(display_name: str) -> str | None:
     across rows or statements ("HDFC BANK LTD" vs "HDFC BANK LTD."), so an
     exact tickers.yaml key lookup misses a real match.
 
-    Deliberately conservative, matching symbol_meta()'s own "never guess"
-    rule: resolves only when EXACTLY one entry's name matches after
-    normalization. Zero or multiple candidates comes back as unresolved
-    (None) rather than picking one — an ambiguous or unmapped company is
-    reported as such, never silently assigned to the wrong stock.
+    `name:` matching alone has a real ceiling: a PDF's own table extraction
+    routinely wraps a single word across a narrow column, splitting it into
+    two tokens ("HINDUSTA N COPPER LTD" for "Hindustan Copper Ltd") that
+    normalize to something a clean, correctly-spelled `name:` field will
+    never equal, no matter how good the normalization is — the raw source
+    text is simply broken in a way _normalize_company_name can't repair
+    after the fact, and a broker's own abbreviations ("TATA POWER CO LTD"
+    for "The Tata Power Company Limited") compound the same problem.
+    Rather than chase an ever-growing set of string-repair heuristics for
+    every corruption/abbreviation pattern a real file might contain,
+    `aliases:` records the EXACT raw text a name was already resolved
+    from — see agents/ticker_resolver.py's SYSTEM_PROMPT and cli.py's
+    _agent_resolved_entry/_reviewed_entry and ticker_seeding's
+    backfill_draft_entry, all of which write one — so a holding already
+    proven to mean this symbol is recognised as such immediately next
+    time, exact match, no fuzzy guessing needed at all.
+
+    Deliberately conservative otherwise, matching symbol_meta()'s own
+    "never guess" rule: the name-based fallback resolves only when EXACTLY
+    one entry's name matches after normalization. Zero or multiple
+    candidates comes back as unresolved (None) rather than picking one —
+    an ambiguous or unmapped company is reported as such, never silently
+    assigned to the wrong stock.
     """
     target = _normalize_company_name(display_name)
     if not target:
         return None
+
+    normalized_display = " ".join(display_name.split()).strip().upper()
+    for sym, meta in load_tickers()["symbols"].items():
+        aliases = meta.get("aliases") or []
+        if any(" ".join(str(a).split()).strip().upper() == normalized_display for a in aliases):
+            return sym
+
     matches = [
         sym for sym, meta in load_tickers()["symbols"].items()
         if _normalize_company_name(meta.get("name", "")) == target

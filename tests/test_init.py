@@ -435,6 +435,56 @@ def test_agent_path_auto_writes_a_high_confidence_resolution(
     assert data["symbols"]["AXISBANK"]["sector"] == "Financial Services"
     assert data["symbols"]["AXISBANK"]["candidates"] == ["AXISBANK.NS"]
     assert data["symbols"]["AXISBANK"]["tier"] == "unknown"  # still your own call
+    # See the backfill test's own comment: without this, re-scanning the
+    # same file again would immediately re-flag "AXIS BANK LIMITED" as
+    # unmapped, even though it was just resolved.
+    assert data["symbols"]["AXISBANK"]["aliases"] == ["AXIS BANK LIMITED"]
+
+
+def test_agent_path_invalidates_the_load_tickers_cache(
+    isolated_project, monkeypatch, capsys
+):
+    """Regression for a reported bug: `factfolio validate` calls
+    validate_main() (which reads and caches config.load_tickers()), then —
+    if unmapped full-name holdings remain — offers and runs this same
+    agent resolver, then calls validate_main() again, all within one
+    process. Without invalidating the cache after the resolver's writes,
+    that second validate_main() call read the pre-resolution snapshot
+    straight back out of the cache: a holding the agent had JUST resolved
+    still showed up as unmapped in the very same run. The two-process
+    workflow this replaced (init, then a separately invoked validate) never
+    exposed this — a fresh process always starts with an empty cache."""
+    from mybroker import config
+    from mybroker.agents.ticker_resolver import ResolvedName
+    from mybroker.ui.cli import _suggest_ticker_matches
+
+    project_dir = _init_project(isolated_project, _BASE_TICKERS_YAML)
+    config.set_project_root(project_dir)
+    (project_dir / "holdings_inbox").mkdir()
+    (project_dir / "holdings_inbox" / "sharekhan.csv").write_text(
+        "Scrip Name,Total Qty,Avg Rate,Holding Value,LTP,Market Value,PL (Rs.),PL%\n"
+        "AXIS BANK LIMITED,39,1331.66,51934.82,1161.30,45290.70,-6644.04,-4.99\n"
+    )
+
+    async def _fake_resolve(holdings):
+        return [ResolvedName(
+            name="AXIS BANK LIMITED", symbol="AXISBANK.NS", confidence="high",
+            reasoning="Exact NSE match.", sector="Financial Services",
+            company_name="Axis Bank Limited",
+        )]
+
+    monkeypatch.setattr("mybroker.agents.ticker_resolver.resolve_names", _fake_resolve)
+
+    # Stand in for cmd_validate's first validate_main() call already having
+    # populated the cache before the resolver ever runs.
+    config.load_tickers.cache_clear()
+    before = config.load_tickers()
+    assert "AXISBANK" not in before["symbols"]
+
+    _suggest_ticker_matches()
+
+    after = config.load_tickers()
+    assert "AXISBANK" in after["symbols"]
 
 
 def test_agent_path_backfills_an_untouched_draft_entry(
@@ -488,6 +538,17 @@ def test_agent_path_backfills_an_untouched_draft_entry(
     # Untouched — still the deterministic guess, still your own call.
     assert data["symbols"]["HDFCBANK"]["candidates"] == ["HDFCBANK.NS", "HDFCBANK.BO"]
     assert data["symbols"]["HDFCBANK"]["bucket"] == "satellite"
+    # The actual regression this covers: without recording the raw source
+    # text as an alias, re-scanning the SAME file immediately afterward
+    # would flag "HDFC BANK LTD" as unmapped all over again, even though
+    # it was just resolved — the clean name: field alone doesn't help
+    # resolve_symbol_by_name back from the raw text that produced it.
+    assert data["symbols"]["HDFCBANK"]["aliases"] == ["HDFC BANK LTD"]
+
+    from mybroker import config
+
+    config.load_tickers.cache_clear()
+    assert config.resolve_symbol_by_name("HDFC BANK LTD") == "HDFCBANK"
 
 
 def test_agent_path_does_not_backfill_an_already_named_entry(
@@ -654,6 +715,115 @@ def test_interactive_skip_writes_nothing(isolated_project, monkeypatch, capsys):
     assert set(data["symbols"]) == {"EXISTING"}
 
 
+def test_interactive_accept_against_pristine_draft_backfills_and_aliases(
+    isolated_project, monkeypatch, capsys
+):
+    """Regression: a holding whose agent-suggested symbol collides with an
+    existing PRISTINE-draft entry (auto-seeded, name never backfilled —
+    the real-world TATASTEEL case, drafted from a short-symbol source,
+    then hit again from a full-name demat PDF row) used to accept into a
+    dead end: 'TATASTEEL is already in tickers.yaml — not overwriting
+    it', with nothing written and no way to ever close out that holding.
+    Accepting now backfills the draft's name/sector AND records the raw
+    PDF text as an alias, exactly like the automatic high-confidence path
+    already does — just reachable from the interactive accept prompt at
+    medium confidence too."""
+    tickers_yaml = (
+        "symbols:\n"
+        "  TATASTEEL:\n"
+        "    name: TATASTEEL  # TODO: replace with the real company name\n"
+        "    candidates: [TATASTEEL.NS, TATASTEEL.BO]  # DRAFT — unverified guess\n"
+        "    sector: Unknown  # TODO\n"
+        "    tier: unknown  # TODO: large | mid | small\n"
+        "    bucket: satellite  # TODO: core | satellite\n"
+        "\n"
+        "indices:\n"
+        '  NIFTY50: { name: Nifty 50, candidates: ["^NSEI"] }\n'
+    )
+    project_dir = _init_project(isolated_project, tickers_yaml)
+    (project_dir / "holdings_inbox").mkdir()
+    (project_dir / "holdings_inbox" / "demat.csv").write_text(
+        "Scrip Name,Total Qty,Avg Rate,Holding Value\n"
+        "TATA STEEL LIMITED,500,185.5,92750\n"
+    )
+    monkeypatch.setattr(
+        "mybroker.agents.ticker_resolver.resolve_names",
+        _uncertain_resolve(
+            name="TATA STEEL LIMITED", symbol="TATASTEEL.BO", confidence="medium",
+        ),
+    )
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda *_a, **_kw: "a")
+
+    cmd_init(None)
+
+    out = capsys.readouterr().out
+    assert "not overwriting" not in out
+    assert "backfilled" in out and "TATASTEEL" in out
+
+    data = yaml.safe_load((project_dir / "tickers.yaml").read_text())
+    entry = data["symbols"]["TATASTEEL"]
+    assert entry["name"] == "Some Company Limited"  # _uncertain_resolve's company_name
+    assert entry["aliases"] == ["TATA STEEL LIMITED"]
+
+    from mybroker import config
+
+    config.load_tickers.cache_clear()
+    assert config.resolve_symbol_by_name("TATA STEEL LIMITED") == "TATASTEEL"
+
+
+def test_interactive_accept_against_named_entry_records_alias(
+    isolated_project, monkeypatch, capsys
+):
+    """Same dead-end bug, one step later: once TATASTEEL above has a real
+    `name:` (no longer pristine), a second holding whose text also lands
+    on that symbol at medium confidence must still be closeable — as an
+    alias on the existing entry, never a silent no-op."""
+    tickers_yaml = (
+        "symbols:\n"
+        "  TATASTEEL:\n"
+        "    name: Tata Steel Limited\n"
+        "    candidates: [TATASTEEL.NS]\n"
+        "    sector: Basic Materials\n"
+        "    tier: large\n"
+        "    bucket: core\n"
+        "\n"
+        "indices:\n"
+        '  NIFTY50: { name: Nifty 50, candidates: ["^NSEI"] }\n'
+    )
+    project_dir = _init_project(isolated_project, tickers_yaml)
+    (project_dir / "holdings_inbox").mkdir()
+    (project_dir / "holdings_inbox" / "demat.csv").write_text(
+        "Scrip Name,Total Qty,Avg Rate,Holding Value\n"
+        "TATA STEEL LTD - PARTLY PAID,500,185.5,92750\n"
+    )
+    monkeypatch.setattr(
+        "mybroker.agents.ticker_resolver.resolve_names",
+        _uncertain_resolve(
+            name="TATA STEEL LTD - PARTLY PAID", symbol="TATASTEEL.BO",
+            confidence="medium",
+        ),
+    )
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda *_a, **_kw: "a")
+
+    cmd_init(None)
+
+    out = capsys.readouterr().out
+    assert "not overwriting" not in out
+    assert "recorded" in out and "TATASTEEL" in out
+
+    data = yaml.safe_load((project_dir / "tickers.yaml").read_text())
+    entry = data["symbols"]["TATASTEEL"]
+    assert entry["name"] == "Tata Steel Limited"  # untouched, already real
+    assert entry["aliases"] == ["TATA STEEL LTD - PARTLY PAID"]
+
+    from mybroker import config
+
+    config.load_tickers.cache_clear()
+    assert config.resolve_symbol_by_name("TATA STEEL LTD - PARTLY PAID") == "TATASTEEL"
+
+
 def test_interactive_blank_input_defaults_to_skip(isolated_project, monkeypatch):
     project_dir = _init_project(isolated_project, _BASE_TICKERS_YAML)
     (project_dir / "holdings_inbox").mkdir()
@@ -709,6 +879,293 @@ def test_interactive_edit_never_overwrites_an_existing_symbol(
         (project_dir / "tickers.yaml").read_text()
     )["symbols"]["ALREADYHERE"]
     assert before == after
+
+
+# ── Interactive follow-up when the agent found no symbol at all ─────────────
+# Distinct from the medium/low-confidence case above: there's no suggestion
+# to accept, since the search came back empty or the agent's claim failed
+# grounding (_validate rejected it). "Correct the name and retry" exists
+# because the source name is often the actual problem — a demat PDF's text
+# extraction routinely mangles names into something no search will match.
+
+def _no_match_resolve(name="HINDUSTA N COPPER LTD"):
+    from mybroker.agents.ticker_resolver import ResolvedName
+
+    async def _fake_resolve(holdings):
+        return [ResolvedName(
+            name=name, symbol=None, confidence="low",
+            reasoning="No confident match found.",
+        )]
+    return _fake_resolve
+
+
+def test_no_match_with_candidate_hint_interactive_accept_writes_it(
+    isolated_project, monkeypatch, capsys
+):
+    """The real fix for a reported bug: a demat PDF's own table extraction
+    put "HINDCOPPER" (the real symbol) in a column nothing here recognises
+    by header, right next to "HINDUSTA N COPPER LTD" (the mangled full
+    name) in the column that does. discover_unmapped_full_names surfaces
+    that as candidate_symbol; resolve_names carries it through even when
+    the agent's own search doesn't independently confirm it; and a human
+    can now accept it in one keystroke instead of the old dead end."""
+    from mybroker.agents.ticker_resolver import ResolvedName
+
+    project_dir = _init_project(isolated_project, _BASE_TICKERS_YAML)
+    (project_dir / "holdings_inbox").mkdir()
+    (project_dir / "holdings_inbox" / "sharekhan.csv").write_text(
+        "CustomerId,SKScrip Code,Stock Name,Quantity,Avg Buy Price\n"
+        "2448297,HINDUSTA N COPPER LTD,HINDCOPP ER,40,383.06\n"
+        "2448297,NTPC LTD,NTPC,100,366.49\n"
+    )
+
+    async def _fake_resolve(holdings):
+        by_name = {h["name"]: h for h in holdings}
+        return [
+            ResolvedName(
+                name=h["name"], symbol=None, confidence="low",
+                reasoning="Search on the mangled name found nothing.",
+                candidate_symbol=h.get("candidate_symbol"),
+            )
+            for h in by_name.values()
+        ]
+
+    monkeypatch.setattr("mybroker.agents.ticker_resolver.resolve_names", _fake_resolve)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda *_a, **_kw: "a")
+
+    cmd_init(None)
+
+    out = capsys.readouterr().out
+    assert "candidate from elsewhere in the same row" in out
+    assert "added" in out and "HINDCOPPER" in out
+    data = yaml.safe_load((project_dir / "tickers.yaml").read_text())
+    assert data["symbols"]["HINDCOPPER"]["candidates"] == ["HINDCOPPER.NS"]
+
+
+def test_no_match_row_data_can_be_viewed_then_typed_from(
+    isolated_project, monkeypatch, capsys
+):
+    """When even the cheap candidate_symbol heuristic found nothing, a
+    human can still ask to see the full raw row (row_data) and decide for
+    themselves — the actual point of this whole feature: give an
+    intelligent reader (a person, here) the real material instead of only
+    ever a narrower Python-guessed field."""
+    from mybroker.agents.ticker_resolver import ResolvedName
+
+    project_dir = _init_project(isolated_project, _BASE_TICKERS_YAML)
+    (project_dir / "holdings_inbox").mkdir()
+    (project_dir / "holdings_inbox" / "sharekhan.csv").write_text(
+        "CustomerId,SKScrip Code,ISIN,Quantity,Avg Buy Price\n"
+        "2448297,SOME MANGLED NAME LTD,INE123A45678,10,100.0\n"
+    )
+
+    async def _fake_resolve(holdings):
+        h = holdings[0]
+        # Deliberately NOT copying candidate_symbol through — this test is
+        # specifically about the case where that cheap heuristic found
+        # nothing at all, only row_data remains.
+        return [ResolvedName(
+            name=h["name"], symbol=None, confidence="low",
+            reasoning="No confident match found.",
+            row_data=h.get("row_data"),
+        )]
+
+    monkeypatch.setattr("mybroker.agents.ticker_resolver.resolve_names", _fake_resolve)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    answers = iter(["r", "t", "SOMECO.NS"])
+    monkeypatch.setattr("builtins.input", lambda *_a, **_kw: next(answers))
+
+    cmd_init(None)
+
+    out = capsys.readouterr().out
+    assert "ISIN" in out and "INE123A45678" in out  # the row was actually printed
+    data = yaml.safe_load((project_dir / "tickers.yaml").read_text())
+    assert data["symbols"]["SOMECO"]["candidates"] == ["SOMECO.NS"]
+
+
+def test_no_match_interactive_type_writes_the_typed_symbol(
+    isolated_project, monkeypatch, capsys
+):
+    project_dir = _init_project(isolated_project, _BASE_TICKERS_YAML)
+    (project_dir / "holdings_inbox").mkdir()
+    (project_dir / "holdings_inbox" / "sharekhan.csv").write_text(
+        "Scrip Name,Total Qty,Avg Rate,Holding Value,LTP,Market Value,PL (Rs.),PL%\n"
+        "HINDUSTA N COPPER LTD,10,100,1000,110,1100,100,10\n"
+    )
+    monkeypatch.setattr(
+        "mybroker.agents.ticker_resolver.resolve_names", _no_match_resolve()
+    )
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    answers = iter(["t", "HINDCOPPER.NS"])
+    monkeypatch.setattr("builtins.input", lambda *_a, **_kw: next(answers))
+
+    cmd_init(None)
+
+    out = capsys.readouterr().out
+    assert "added" in out and "HINDCOPPER.NS" in out
+    data = yaml.safe_load((project_dir / "tickers.yaml").read_text())
+    assert data["symbols"]["HINDCOPPER"]["candidates"] == ["HINDCOPPER.NS"]
+
+
+def test_no_match_interactive_correct_name_finds_and_accepts(
+    isolated_project, monkeypatch, capsys
+):
+    """The actual real-world case this closes: a demat PDF mangled
+    "Hindustan Copper Ltd" into "HINDUSTA N COPPER LTD" (a stray mid-word
+    space), so the agent's own search came back empty. Correcting the name
+    finds it on a plain retry — no second agent call needed."""
+    project_dir = _init_project(isolated_project, _BASE_TICKERS_YAML)
+    (project_dir / "holdings_inbox").mkdir()
+    (project_dir / "holdings_inbox" / "sharekhan.csv").write_text(
+        "Scrip Name,Total Qty,Avg Rate,Holding Value,LTP,Market Value,PL (Rs.),PL%\n"
+        "HINDUSTA N COPPER LTD,10,100,1000,110,1100,100,10\n"
+    )
+    monkeypatch.setattr(
+        "mybroker.agents.ticker_resolver.resolve_names", _no_match_resolve()
+    )
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr(
+        "mybroker.config.suggest_ticker_for_name",
+        lambda name: "HINDCOPPER.NS" if name == "Hindustan Copper Ltd" else None,
+    )
+    answers = iter(["c", "Hindustan Copper Ltd", "a"])
+    monkeypatch.setattr("builtins.input", lambda *_a, **_kw: next(answers))
+
+    cmd_init(None)
+
+    out = capsys.readouterr().out
+    assert "added" in out and "HINDCOPPER.NS" in out
+    data = yaml.safe_load((project_dir / "tickers.yaml").read_text())
+    assert data["symbols"]["HINDCOPPER"]["candidates"] == ["HINDCOPPER.NS"]
+
+
+def test_no_match_interactive_correct_name_still_not_found(
+    isolated_project, monkeypatch, capsys
+):
+    project_dir = _init_project(isolated_project, _BASE_TICKERS_YAML)
+    (project_dir / "holdings_inbox").mkdir()
+    (project_dir / "holdings_inbox" / "sharekhan.csv").write_text(
+        "Scrip Name,Total Qty,Avg Rate,Holding Value,LTP,Market Value,PL (Rs.),PL%\n"
+        "HINDUSTA N COPPER LTD,10,100,1000,110,1100,100,10\n"
+    )
+    monkeypatch.setattr(
+        "mybroker.agents.ticker_resolver.resolve_names", _no_match_resolve()
+    )
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("mybroker.config.suggest_ticker_for_name", lambda name: None)
+    answers = iter(["c", "Still Not A Real Match Ltd"])
+    monkeypatch.setattr("builtins.input", lambda *_a, **_kw: next(answers))
+
+    cmd_init(None)
+
+    out = capsys.readouterr().out
+    assert "No match found" in out
+    data = yaml.safe_load((project_dir / "tickers.yaml").read_text())
+    assert set(data["symbols"]) == {"EXISTING"}
+
+
+def test_no_match_interactive_skip_writes_nothing(
+    isolated_project, monkeypatch, capsys
+):
+    project_dir = _init_project(isolated_project, _BASE_TICKERS_YAML)
+    (project_dir / "holdings_inbox").mkdir()
+    (project_dir / "holdings_inbox" / "sharekhan.csv").write_text(
+        "Scrip Name,Total Qty,Avg Rate,Holding Value,LTP,Market Value,PL (Rs.),PL%\n"
+        "HINDUSTA N COPPER LTD,10,100,1000,110,1100,100,10\n"
+    )
+    monkeypatch.setattr(
+        "mybroker.agents.ticker_resolver.resolve_names", _no_match_resolve()
+    )
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda *_a, **_kw: "s")
+
+    cmd_init(None)
+
+    data = yaml.safe_load((project_dir / "tickers.yaml").read_text())
+    assert set(data["symbols"]) == {"EXISTING"}
+
+
+# ── Interactive follow-up when the suggested symbol already maps a
+# DIFFERENT holding ──────────────────────────────────────────────────────
+# The demerger case: the agent's own suggested symbol is already in
+# tickers.yaml, but for a different real-world entity than this specific
+# holding (Tata Motors' 2024 split into TMCV/TMPV, say) — accepting it
+# blind would be wrong, and until this, there was no way to say "no,
+# that's a separate holding" other than hand-editing the YAML afterward.
+
+_TMCV_TICKERS_YAML = (
+    "symbols:\n"
+    "  TMCV:\n"
+    "    name: Tata Motors Commercial Vehicles Limited\n"
+    "    candidates: [TMCV.NS]\n"
+    "    sector: Automobile\n"
+    "    tier: large\n"
+    "    bucket: core\n"
+    "\n"
+    "indices:\n"
+    '  NIFTY50: { name: Nifty 50, candidates: ["^NSEI"] }\n'
+)
+
+
+def _already_mapped_resolve():
+    from mybroker.agents.ticker_resolver import ResolvedName
+
+    async def _fake_resolve(holdings):
+        return [ResolvedName(
+            name="TATA MOTORS LIMITED", symbol="TMCV.NS", confidence="medium",
+            reasoning="Same qty as a related demerger row — possibly a "
+                      "separate pre-demerger holding, not a duplicate.",
+        )]
+    return _fake_resolve
+
+
+def test_already_mapped_interactive_edit_writes_a_separate_entry(
+    isolated_project, monkeypatch, capsys
+):
+    project_dir = _init_project(isolated_project, _TMCV_TICKERS_YAML)
+    (project_dir / "holdings_inbox").mkdir()
+    (project_dir / "holdings_inbox" / "sharekhan.csv").write_text(
+        "Scrip Name,Total Qty,Avg Rate,Holding Value,LTP,Market Value,PL (Rs.),PL%\n"
+        "TATA MOTORS LIMITED,59,179.87,10612.33,321.30,18956.70,8344.37,78.6\n"
+    )
+    monkeypatch.setattr(
+        "mybroker.agents.ticker_resolver.resolve_names", _already_mapped_resolve()
+    )
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    answers = iter(["e", "TMPV.NS"])
+    monkeypatch.setattr("builtins.input", lambda *_a, **_kw: next(answers))
+
+    cmd_init(None)
+
+    out = capsys.readouterr().out
+    assert "added" in out and "TMPV.NS" in out
+    data = yaml.safe_load((project_dir / "tickers.yaml").read_text())
+    assert "TMPV" in data["symbols"]
+    assert data["symbols"]["TMPV"]["candidates"] == ["TMPV.NS"]
+    assert "TMCV" in data["symbols"]  # untouched
+
+
+def test_already_mapped_non_interactive_only_prints(isolated_project, monkeypatch, capsys):
+    """Same scripted/piped safety as every other interactive prompt here —
+    no hang waiting for input that will never come."""
+    project_dir = _init_project(isolated_project, _TMCV_TICKERS_YAML)
+    (project_dir / "holdings_inbox").mkdir()
+    (project_dir / "holdings_inbox" / "sharekhan.csv").write_text(
+        "Scrip Name,Total Qty,Avg Rate,Holding Value,LTP,Market Value,PL (Rs.),PL%\n"
+        "TATA MOTORS LIMITED,59,179.87,10612.33,321.30,18956.70,8344.37,78.6\n"
+    )
+    monkeypatch.setattr(
+        "mybroker.agents.ticker_resolver.resolve_names", _already_mapped_resolve()
+    )
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+
+    cmd_init(None)
+
+    out = capsys.readouterr().out
+    assert "is already in tickers.yaml" in out
+    data = yaml.safe_load((project_dir / "tickers.yaml").read_text())
+    assert set(data["symbols"]) == {"TMCV"}
 
 
 def test_agent_path_does_not_write_a_flagged_duplicate(
