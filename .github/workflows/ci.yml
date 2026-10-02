@@ -21,8 +21,11 @@ jobs:
         with:
           enable-cache: true
 
+      # --locked fails the job if uv.lock is out of date with pyproject.toml
+      # (e.g. a version bump without re-running `uv lock`) instead of
+      # silently re-resolving on the runner.
       - name: Install dependencies
-        run: uv sync --extra dev
+        run: uv sync --locked --extra dev
 
       - name: Lint (ruff)
         run: uv run ruff check src/ tests/
